@@ -180,7 +180,7 @@ class CuObjClientWrapper:
     _ERROR_PREFIXES: tuple = ("error", "fail", "fault")
 
     @staticmethod
-    def parse_rdma_reply(reply_header: str) -> bool:
+    def parse_rdma_reply(reply_header: Optional[str]) -> bool:
         """Parse the ``x-amz-rdma-reply`` response header.
 
         Returns *True* if the header indicates successful RDMA

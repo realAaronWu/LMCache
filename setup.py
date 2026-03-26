@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from pathlib import Path
+from typing import Optional
 import os
 import sys
 
@@ -24,7 +25,7 @@ BUILD_WITH_HIP = os.environ.get("BUILD_WITH_HIP", "0") == "1"
 ENABLE_CXX11_ABI = os.environ.get("ENABLE_CXX11_ABI", "1") == "1"
 
 
-def _find_cuobject_paths() -> tuple:
+def _find_cuobject_paths() -> tuple[Optional[str], Optional[str]]:
     """Locate the cuObjClient SDK (cuobjclient.h + libcuobjclient.so).
 
     Returns (include_dir, lib_dir) or (None, None) if not found.
