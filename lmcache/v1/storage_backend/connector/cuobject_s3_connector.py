@@ -305,10 +305,9 @@ class CuObjectS3Connector(S3Connector):
                 except Exception as exc:
                     logger.warning(f"Error deregistering RDMA pool: {exc}")
                 self._rdma_pool_handle = None
-            try:
-                self._cuobj_client.close()
-            except Exception as exc:
-                logger.warning(f"Error closing cuObject client: {exc}")
+            rc = self._cuobj_client.close()
+            if rc != CU_OBJ_SUCCESS:
+                logger.warning(f"cuObject client close returned error {rc}")
             self._cuobj_client = None
             self._rdma_enabled = False
         await super().close()
