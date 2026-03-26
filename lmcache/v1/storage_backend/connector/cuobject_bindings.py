@@ -265,14 +265,13 @@ class CuObjClientWrapper:
             )
         return False
 
-    def close(self) -> None:
+    def close(self) -> int:
         """Destroy the cuObject client and release RDMA resources."""
+        rc = CU_OBJ_SUCCESS
         if self._client is not None:
             rc = self._client.close()
-            if rc != CU_OBJ_SUCCESS:
-                logger.warning(f"cuObjClientDestroy returned error {rc}")
             self._client = None
-            logger.info("cuObject client destroyed")
+        return rc
 
     def __del__(self):
         self.close()
