@@ -439,11 +439,13 @@ class TestClose:
         fake_client = _make_fake_cpp_client()
         fake_client.close.return_value = 99
         wrapper, _ = _build_wrapper(fake_client)
-        logger_name = (
+        _logger = logging.getLogger(
             "lmcache.v1.storage_backend.connector.cuobject_bindings"
         )
-        with caplog.at_level(logging.WARNING, logger=logger_name):
-            wrapper.close()
+        caplog.handler.setLevel(logging.WARNING)
+        _logger.addHandler(caplog.handler)
+        wrapper.close()
+        _logger.removeHandler(caplog.handler)
         assert "returned error 99" in caplog.text
 
     # Scenario: __del__ triggers close() to release RDMA resources when
