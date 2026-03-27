@@ -271,6 +271,8 @@ class CuObjClientWrapper:
         if self._client is not None:
             rc = self._client.close()
             self._client = None
+            if rc != CU_OBJ_SUCCESS:
+                logger.warning(f"cuObject client close() returned error {rc}")
         return rc
 
     def __del__(self):
