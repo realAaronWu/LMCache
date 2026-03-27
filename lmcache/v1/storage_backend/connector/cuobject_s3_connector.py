@@ -16,6 +16,7 @@ from lmcache.v1.memory_management import (
     PinMemoryAllocator,
 )
 from lmcache.v1.storage_backend.connector.cuobject_bindings import (
+    CU_OBJ_SUCCESS,
     CuObjClientWrapper,
     CuObjConfig,
 )
@@ -305,9 +306,14 @@ class CuObjectS3Connector(S3Connector):
                 except Exception as exc:
                     logger.warning(f"Error deregistering RDMA pool: {exc}")
                 self._rdma_pool_handle = None
-            rc = self._cuobj_client.close()
-            if rc != CU_OBJ_SUCCESS:
-                logger.warning(f"cuObject client close returned error {rc}")
+            try:
+                rc = self._cuobj_client.close()
+                if rc != CU_OBJ_SUCCESS:
+                    logger.warning(
+                        f"cuObject client close returned error {rc}"
+                    )
+            except Exception as exc:
+                logger.warning(f"Error closing cuObject client: {exc}")
             self._cuobj_client = None
             self._rdma_enabled = False
         await super().close()
