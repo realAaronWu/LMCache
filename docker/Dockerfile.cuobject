@@ -25,9 +25,25 @@ USER root
 RUN apt-get update -y \
     && apt-get install -y --no-install-recommends \
         wget \
+        git \
         xz-utils \
         libibverbs-dev \
         librdmacm-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install CUDA dev headers required to compile LMCache CUDA extensions.
+# The vllm-openai base image ships only the CUDA runtime (no headers).
+# We detect the CUDA version from nvcc and install the matching -dev packages.
+RUN CUDA_VER=$(nvcc --version | grep -oP 'release \K[0-9]+\.[0-9]+') \
+    && CUDA_VER_DASH=$(echo $CUDA_VER | tr '.' '-') \
+    && echo "Detected CUDA ${CUDA_VER}, installing dev headers..." \
+    && apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+        libcusparse-dev-${CUDA_VER_DASH} \
+        libcublas-dev-${CUDA_VER_DASH} \
+        libcusolver-dev-${CUDA_VER_DASH} \
+        libcurand-dev-${CUDA_VER_DASH} \
+        cuda-cudart-dev-${CUDA_VER_DASH} \
     && rm -rf /var/lib/apt/lists/*
 
 # Download and extract cuObjClient SDK (header + shared lib)
