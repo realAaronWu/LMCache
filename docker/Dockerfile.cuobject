@@ -62,7 +62,9 @@ RUN wget -q "${NVIDIA_REDIST}/${CUOBJCLIENT_TAR}" -O /tmp/sdk.tar.xz \
     && cp /tmp/libcuobjclient-*/include/* /usr/local/cuda/include/ \
     && cp -a /tmp/libcuobjclient-*/lib/* /usr/local/cuda/lib64/ \
     && rm -rf /tmp/sdk.tar.xz /tmp/libcuobjclient-* \
+    && ldconfig /usr/local/cuda/lib64/ \
     && ls /usr/local/cuda/include/cuobjclient.h \
+    && ldconfig -p | grep cuobjclient \
     && echo "cuObjClient SDK installed into CUDA_HOME"
 
 #################### vLLM + LMCache + cuObject (Build) ####################
@@ -111,6 +113,6 @@ ENV PYTHONHASHSEED=0
 ENV LMCACHE_MAX_LOCAL_CPU_SIZE=66
 
 WORKDIR /workspace
-COPY docker/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN cp /workspace/LMCache/docker/entrypoint.sh /entrypoint.sh \
+    && chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
