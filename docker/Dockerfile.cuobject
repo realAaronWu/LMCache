@@ -103,6 +103,8 @@ WORKDIR /opt/lmcache
 # Use hardcoded paths -- ARG values are not available in ENV substitution
 ENV CUOBJECT_INCLUDE_DIR=/opt/cuobject/include
 ENV CUOBJECT_LIB_DIR=/opt/cuobject/lib
+# Set LD_LIBRARY_PATH now so the import verification can find libcuobjclient.so
+ENV LD_LIBRARY_PATH="/opt/cuobject/lib:${LD_LIBRARY_PATH}"
 
 # Debug: verify SDK is reachable before build
 RUN echo "CUOBJECT_INCLUDE_DIR=${CUOBJECT_INCLUDE_DIR}" \
@@ -117,9 +119,6 @@ RUN pip install --no-cache-dir -e . --no-build-isolation \
 # ---------------------------------------------------------------------------
 # Runtime environment
 # ---------------------------------------------------------------------------
-
-# Ensure libcuobjclient.so is findable at runtime
-ENV LD_LIBRARY_PATH="/opt/cuobject/lib:${LD_LIBRARY_PATH}"
 
 # Default LMCache settings (can be overridden at runtime)
 ENV PYTHONHASHSEED=0
