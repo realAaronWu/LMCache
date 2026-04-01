@@ -3,51 +3,60 @@
 #
 # Base: vllm/vllm-openai (includes PyTorch + CUDA runtime + vLLM)
 # Adds: LMCache from source with cuObject pybind11 extension
-# CUDA 13.1 toolkit installed alongside for cuObjClient SDK only
+# cuObjClient SDK installed from NVIDIA redistributable tarball (~150 KB)
 # ---------------------------------------------------------------------------
 FROM vllm/vllm-openai:latest AS base
 
 # ---------------------------------------------------------------------------
-# Stage 1: Install CUDA 13.1 toolkit (cuObject SDK only)
+# Stage 1: Install cuObjClient SDK from NVIDIA redistributable
 #
-# We install the CUDA 13.1 toolkit to a separate prefix so it does not
-# interfere with the base image's CUDA (12.x). Only cuobjclient.h and
-# libcuobjclient.so are needed from this installation.
+# Instead of installing the full CUDA 13.1 toolkit (~4 GB), we download
+# only the cuObjClient library tarball (~150 KB) and the cuFile library
+# (~43 MB) from NVIDIA's redistrib endpoint. These are extracted to
+# /opt/cuobject/ and used for both build and runtime.
 # ---------------------------------------------------------------------------
-ARG CUDA_13_VERSION=13.1.1
-ARG CUDA_13_RUNFILE_URL=https://developer.download.nvidia.com/compute/cuda/13.1.1/local_installers/cuda_13.1.1_570.124.06_linux.run
-ARG CUDA_13_PREFIX=/usr/local/cuda-13.1
+ARG NVIDIA_REDIST_BASE=https://developer.download.nvidia.com/compute/cuda/redist
+ARG CUOBJCLIENT_TARBALL=libcuobjclient/linux-x86_64/libcuobjclient-linux-x86_64-1.0.0.26-archive.tar.xz
+ARG CUFILE_TARBALL=libcufile/linux-x86_64/libcufile-linux-x86_64-1.16.1.26-archive.tar.xz
+ARG CUOBJECT_PREFIX=/opt/cuobject
 
 USER root
 
 RUN apt-get update -y \
     && apt-get install -y --no-install-recommends \
         wget \
+        xz-utils \
         libibverbs-dev \
         librdmacm-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Download and install CUDA 13.1 toolkit only (no driver, no symlink)
-RUN wget -q "${CUDA_13_RUNFILE_URL}" -O /tmp/cuda_13.run \
-    && chmod +x /tmp/cuda_13.run \
-    && /tmp/cuda_13.run \
-        --toolkit \
-        --toolkitpath=${CUDA_13_PREFIX} \
-        --no-man-page \
-        --no-opengl-libs \
-        --override \
-        --silent \
-    && rm -f /tmp/cuda_13.run
+# Download and extract cuObjClient SDK (header + shared lib)
+RUN mkdir -p ${CUOBJECT_PREFIX}/include ${CUOBJECT_PREFIX}/lib \
+    && wget -q "${NVIDIA_REDIST_BASE}/${CUOBJCLIENT_TARBALL}" -O /tmp/cuobjclient.tar.xz \
+    && tar -xf /tmp/cuobjclient.tar.xz -C /tmp \
+    && cp /tmp/libcuobjclient-*/include/* ${CUOBJECT_PREFIX}/include/ \
+    && cp /tmp/libcuobjclient-*/lib/* ${CUOBJECT_PREFIX}/lib/ \
+    && rm -rf /tmp/cuobjclient.tar.xz /tmp/libcuobjclient-*
+
+# Download and extract cuFile library (runtime dependency of cuObjClient)
+RUN wget -q "${NVIDIA_REDIST_BASE}/${CUFILE_TARBALL}" -O /tmp/cufile.tar.xz \
+    && tar -xf /tmp/cufile.tar.xz -C /tmp \
+    && cp /tmp/libcufile-*/include/* ${CUOBJECT_PREFIX}/include/ 2>/dev/null || true \
+    && cp /tmp/libcufile-*/lib/* ${CUOBJECT_PREFIX}/lib/ 2>/dev/null || true \
+    && cp -r /tmp/libcufile-*/lib/x86_64-linux-gnu/* ${CUOBJECT_PREFIX}/lib/ 2>/dev/null || true \
+    && rm -rf /tmp/cufile.tar.xz /tmp/libcufile-*
 
 # Verify cuobjclient.h is present
-RUN test -f ${CUDA_13_PREFIX}/include/cuobjclient.h \
-    && echo "cuObjClient SDK found at ${CUDA_13_PREFIX}" \
-    || (echo "ERROR: cuobjclient.h not found in ${CUDA_13_PREFIX}/include/" && exit 1)
+RUN test -f ${CUOBJECT_PREFIX}/include/cuobjclient.h \
+    && echo "cuObjClient SDK found at ${CUOBJECT_PREFIX}" \
+    && ls -la ${CUOBJECT_PREFIX}/include/cuobjclient.h \
+    && ls -la ${CUOBJECT_PREFIX}/lib/ \
+    || (echo "ERROR: cuobjclient.h not found" && exit 1)
 
 # ---------------------------------------------------------------------------
 # Stage 2: Install LMCache from source with cuObject extension
 #
-# CUOBJECT_INCLUDE_DIR / CUOBJECT_LIB_DIR point at CUDA 13.1.
+# CUOBJECT_INCLUDE_DIR / CUOBJECT_LIB_DIR point at the extracted SDK.
 # CUDA_HOME stays at the base image's CUDA (used by PyTorch extensions).
 # The cuObject pybind11 extension (lmcache_cuobject) is a CppExtension,
 # not a CUDAExtension, so it only needs the C++ compiler + cuobjclient.h.
@@ -62,19 +71,19 @@ RUN git clone --depth 1 --branch ${LMCACHE_BRANCH} ${LMCACHE_REPO} /opt/lmcache
 WORKDIR /opt/lmcache
 
 # Build LMCache with cuObject extension
-ENV CUOBJECT_INCLUDE_DIR=${CUDA_13_PREFIX}/include
-ENV CUOBJECT_LIB_DIR=${CUDA_13_PREFIX}/lib64
+ENV CUOBJECT_INCLUDE_DIR=${CUOBJECT_PREFIX}/include
+ENV CUOBJECT_LIB_DIR=${CUOBJECT_PREFIX}/lib
 
 RUN pip install --no-cache-dir -e . --no-build-isolation \
-    && python -c "from lmcache.lmcache_cuobject import CuObjectClient; print('cuObject extension: OK')" \
+    && python -c "import torch; from lmcache.lmcache_cuobject import CuObjectClient; print('cuObject extension: OK')" \
     && echo "LMCache installed successfully with cuObject support"
 
 # ---------------------------------------------------------------------------
 # Runtime environment
 # ---------------------------------------------------------------------------
 
-# Ensure libcuobjclient.so and libtorch are findable at runtime
-ENV LD_LIBRARY_PATH="${CUDA_13_PREFIX}/lib64:${LD_LIBRARY_PATH}"
+# Ensure libcuobjclient.so is findable at runtime
+ENV LD_LIBRARY_PATH="${CUOBJECT_PREFIX}/lib:${LD_LIBRARY_PATH}"
 
 # Default LMCache settings (can be overridden at runtime)
 ENV PYTHONHASHSEED=0
