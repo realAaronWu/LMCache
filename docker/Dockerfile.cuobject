@@ -70,6 +70,18 @@ RUN test -f ${CUOBJECT_PREFIX}/include/cuobjclient.h \
     && ls -la ${CUOBJECT_PREFIX}/lib/ \
     || (echo "ERROR: cuobjclient.h not found" && exit 1)
 
+# cuobjclient.h -> cufile.h -> cuda.h. The cuObject CppExtension only
+# includes /opt/cuobject/include, not /usr/local/cuda/include. Symlink
+# cuda.h (and cudaTypedefs.h which cuda.h may pull) into the SDK dir
+# so the compiler can resolve the transitive include.
+RUN for h in cuda.h cudaTypedefs.h; do \
+        if [ -f /usr/local/cuda/include/$h ] && [ ! -f ${CUOBJECT_PREFIX}/include/$h ]; then \
+            ln -s /usr/local/cuda/include/$h ${CUOBJECT_PREFIX}/include/$h; \
+        fi; \
+    done \
+    && echo "Symlinked CUDA headers into ${CUOBJECT_PREFIX}/include/" \
+    && ls -la ${CUOBJECT_PREFIX}/include/cuda*.h
+
 # ---------------------------------------------------------------------------
 # Stage 2: Install LMCache from source with cuObject extension
 #
