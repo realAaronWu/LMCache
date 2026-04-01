@@ -21,7 +21,7 @@ export PYTHONHASHSEED
 export LMCACHE_MAX_LOCAL_CPU_SIZE
 
 # ---- Verify cuObject (optional, non-fatal) --------------------------------
-if python -c "from lmcache.lmcache_cuobject import CuObjectClient" 2>/dev/null; then
+if python3 -c "from lmcache.lmcache_cuobject import CuObjectClient" 2>/dev/null; then
     echo "[entrypoint] cuObject extension: available"
 else
     echo "[entrypoint] cuObject extension: NOT available (RDMA will fall back to HTTP)"

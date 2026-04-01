@@ -91,7 +91,7 @@ ENV CUOBJECT_INCLUDE_DIR=${CUOBJECT_PREFIX}/include
 ENV CUOBJECT_LIB_DIR=${CUOBJECT_PREFIX}/lib
 
 RUN pip install --no-cache-dir -e . --no-build-isolation \
-    && python -c "import torch; from lmcache.lmcache_cuobject import CuObjectClient; print('cuObject extension: OK')" \
+    && python3 -c "import torch; from lmcache.lmcache_cuobject import CuObjectClient; print('cuObject extension: OK')" \
     && echo "LMCache installed successfully with cuObject support"
 
 # ---------------------------------------------------------------------------
