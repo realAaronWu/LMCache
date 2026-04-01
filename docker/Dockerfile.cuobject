@@ -1,0 +1,88 @@
+# ---------------------------------------------------------------------------
+# LMCache + vLLM + cuObject S3 RDMA Docker Image
+#
+# Base: vllm/vllm-openai (includes PyTorch + CUDA runtime + vLLM)
+# Adds: LMCache from source with cuObject pybind11 extension
+# CUDA 13.1 toolkit installed alongside for cuObjClient SDK only
+# ---------------------------------------------------------------------------
+FROM vllm/vllm-openai:latest AS base
+
+# ---------------------------------------------------------------------------
+# Stage 1: Install CUDA 13.1 toolkit (cuObject SDK only)
+#
+# We install the CUDA 13.1 toolkit to a separate prefix so it does not
+# interfere with the base image's CUDA (12.x). Only cuobjclient.h and
+# libcuobjclient.so are needed from this installation.
+# ---------------------------------------------------------------------------
+ARG CUDA_13_VERSION=13.1.1
+ARG CUDA_13_RUNFILE_URL=https://developer.download.nvidia.com/compute/cuda/13.1.1/local_installers/cuda_13.1.1_570.124.06_linux.run
+ARG CUDA_13_PREFIX=/usr/local/cuda-13.1
+
+USER root
+
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+        wget \
+        libibverbs-dev \
+        librdmacm-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Download and install CUDA 13.1 toolkit only (no driver, no symlink)
+RUN wget -q "${CUDA_13_RUNFILE_URL}" -O /tmp/cuda_13.run \
+    && chmod +x /tmp/cuda_13.run \
+    && /tmp/cuda_13.run \
+        --toolkit \
+        --toolkitpath=${CUDA_13_PREFIX} \
+        --no-man-page \
+        --no-opengl-libs \
+        --override \
+        --silent \
+    && rm -f /tmp/cuda_13.run
+
+# Verify cuobjclient.h is present
+RUN test -f ${CUDA_13_PREFIX}/include/cuobjclient.h \
+    && echo "cuObjClient SDK found at ${CUDA_13_PREFIX}" \
+    || (echo "ERROR: cuobjclient.h not found in ${CUDA_13_PREFIX}/include/" && exit 1)
+
+# ---------------------------------------------------------------------------
+# Stage 2: Install LMCache from source with cuObject extension
+#
+# CUOBJECT_INCLUDE_DIR / CUOBJECT_LIB_DIR point at CUDA 13.1.
+# CUDA_HOME stays at the base image's CUDA (used by PyTorch extensions).
+# The cuObject pybind11 extension (lmcache_cuobject) is a CppExtension,
+# not a CUDAExtension, so it only needs the C++ compiler + cuobjclient.h.
+# ---------------------------------------------------------------------------
+ARG LMCACHE_REPO=https://github.com/LMCache/LMCache.git
+ARG LMCACHE_BRANCH=dev
+
+WORKDIR /opt
+
+RUN git clone --depth 1 --branch ${LMCACHE_BRANCH} ${LMCACHE_REPO} /opt/lmcache
+
+WORKDIR /opt/lmcache
+
+# Build LMCache with cuObject extension
+ENV CUOBJECT_INCLUDE_DIR=${CUDA_13_PREFIX}/include
+ENV CUOBJECT_LIB_DIR=${CUDA_13_PREFIX}/lib64
+
+RUN pip install --no-cache-dir -e . --no-build-isolation \
+    && python -c "from lmcache.lmcache_cuobject import CuObjectClient; print('cuObject extension: OK')" \
+    && echo "LMCache installed successfully with cuObject support"
+
+# ---------------------------------------------------------------------------
+# Runtime environment
+# ---------------------------------------------------------------------------
+
+# Ensure libcuobjclient.so and libtorch are findable at runtime
+ENV LD_LIBRARY_PATH="${CUDA_13_PREFIX}/lib64:${LD_LIBRARY_PATH}"
+
+# Default LMCache settings (can be overridden at runtime)
+ENV PYTHONHASHSEED=0
+ENV LMCACHE_MAX_LOCAL_CPU_SIZE=66
+
+WORKDIR /workspace
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
