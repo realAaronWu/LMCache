@@ -1,132 +1,116 @@
-# ---------------------------------------------------------------------------
 # LMCache + vLLM + cuObject S3 RDMA Docker Image
 #
-# Base: vllm/vllm-openai (includes PyTorch + CUDA runtime + vLLM)
-# Adds: LMCache from source with cuObject pybind11 extension
-# cuObjClient SDK installed from NVIDIA redistributable tarball (~150 KB)
-# ---------------------------------------------------------------------------
-FROM vllm/vllm-openai:latest AS base
-
-# ---------------------------------------------------------------------------
-# Stage 1: Install cuObjClient SDK from NVIDIA redistributable
+# Identical to the main Dockerfile (CUDA 12.8 base for vLLM/PyTorch),
+# with the cuObjClient SDK (from CUDA 13.1) added for the cuObject
+# pybind11 extension only. The SDK is a header + shared lib that does
+# not conflict with the base CUDA version.
 #
-# Instead of installing the full CUDA 13.1 toolkit (~4 GB), we download
-# only the cuObjClient library tarball (~150 KB) and the cuFile library
-# (~43 MB) from NVIDIA's redistrib endpoint. These are extracted to
-# /opt/cuobject/ and used for both build and runtime.
-# ---------------------------------------------------------------------------
-ARG NVIDIA_REDIST_BASE=https://developer.download.nvidia.com/compute/cuda/redist
-ARG CUOBJCLIENT_TARBALL=libcuobjclient/linux-x86_64/libcuobjclient-linux-x86_64-1.0.0.26-archive.tar.xz
-ARG CUFILE_TARBALL=libcufile/linux-x86_64/libcufile-linux-x86_64-1.16.1.26-archive.tar.xz
-ARG CUOBJECT_PREFIX=/opt/cuobject
+# Build from repo root:
+#   docker build --target image-build \
+#       -f docker/Dockerfile.cuobject \
+#       -t lmcache/vllm-cuobject:latest .
 
-USER root
+ARG CUDA_VERSION=12.8
+ARG UBUNTU_VERSION=24.04
 
-RUN apt-get update -y \
-    && apt-get install -y --no-install-recommends \
-        wget \
-        git \
-        xz-utils \
-        libibverbs-dev \
-        librdmacm-dev \
-    && rm -rf /var/lib/apt/lists/*
+#################### BASE BUILD IMAGE ####################
 
-# Install CUDA dev headers required to compile LMCache CUDA extensions.
-# The vllm-openai base image ships only the CUDA runtime (no headers).
-# We detect the CUDA version from nvcc and install the matching -dev packages.
-RUN CUDA_VER=$(nvcc --version | grep -oP 'release \K[0-9]+\.[0-9]+') \
-    && CUDA_VER_DASH=$(echo $CUDA_VER | tr '.' '-') \
-    && echo "Detected CUDA ${CUDA_VER}, installing dev headers..." \
+FROM nvcr.io/nvidia/cuda-dl-base:25.03-cuda${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS base
+
+ARG CUDA_VERSION
+ARG PYTHON_VERSION=3.12
+ARG UBUNTU_VERSION
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH="/opt/venv/bin:${PATH}"
+
+RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
+    && echo 'tzdata tzdata/Zones/America select Los_Angeles' | debconf-set-selections \
     && apt-get update -y \
     && apt-get install -y --no-install-recommends \
-        cuda-cudart-dev-${CUDA_VER_DASH} \
-        cuda-driver-dev-${CUDA_VER_DASH} \
-        libcusparse-dev-${CUDA_VER_DASH} \
-        libcublas-dev-${CUDA_VER_DASH} \
-        libcusolver-dev-${CUDA_VER_DASH} \
-        libcurand-dev-${CUDA_VER_DASH} \
-    && rm -rf /var/lib/apt/lists/*
+        ccache software-properties-common git curl sudo wget xz-utils \
+        python3 python3-dev python3-venv python3-pip tzdata libxcb1-dev \
+        libibverbs-dev librdmacm-dev \
+    && ldconfig /usr/local/cuda-$(echo $CUDA_VERSION | cut -d. -f1,2)/compat/ \
+    && curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && mv ~/.local/bin/uv /usr/local/bin/ \
+    && mv ~/.local/bin/uvx /usr/local/bin/ \
+    && uv venv /opt/venv \
+    && . /opt/venv/bin/activate \
+    && python3 --version
 
-# Download and extract cuObjClient SDK (header + shared lib)
-RUN mkdir -p ${CUOBJECT_PREFIX}/include ${CUOBJECT_PREFIX}/lib \
-    && wget -q "${NVIDIA_REDIST_BASE}/${CUOBJCLIENT_TARBALL}" -O /tmp/cuobjclient.tar.xz \
-    && tar -xf /tmp/cuobjclient.tar.xz -C /tmp \
-    && cp /tmp/libcuobjclient-*/include/* ${CUOBJECT_PREFIX}/include/ \
-    && cp /tmp/libcuobjclient-*/lib/* ${CUOBJECT_PREFIX}/lib/ \
-    && rm -rf /tmp/cuobjclient.tar.xz /tmp/libcuobjclient-*
+WORKDIR /workspace
 
-# Download and extract cuFile library (runtime dependency of cuObjClient)
-RUN wget -q "${NVIDIA_REDIST_BASE}/${CUFILE_TARBALL}" -O /tmp/cufile.tar.xz \
-    && tar -xf /tmp/cufile.tar.xz -C /tmp \
-    && cp /tmp/libcufile-*/include/* ${CUOBJECT_PREFIX}/include/ 2>/dev/null || true \
-    && cp /tmp/libcufile-*/lib/* ${CUOBJECT_PREFIX}/lib/ 2>/dev/null || true \
-    && cp -r /tmp/libcufile-*/lib/x86_64-linux-gnu/* ${CUOBJECT_PREFIX}/lib/ 2>/dev/null || true \
-    && rm -rf /tmp/cufile.tar.xz /tmp/libcufile-*
+COPY ./requirements/common.txt common.txt
+COPY ./requirements/cuda.txt cuda.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    . /opt/venv/bin/activate && \
+    uv pip install -r cuda.txt
 
-# Verify cuobjclient.h is present
-RUN test -f ${CUOBJECT_PREFIX}/include/cuobjclient.h \
-    && echo "cuObjClient SDK found at ${CUOBJECT_PREFIX}" \
-    && ls -la ${CUOBJECT_PREFIX}/include/cuobjclient.h \
-    && ls -la ${CUOBJECT_PREFIX}/lib/ \
-    || (echo "ERROR: cuobjclient.h not found" && exit 1)
+ARG torch_cuda_arch_list='7.0 7.5 8.0 8.6 8.9 9.0 10.0+PTX'
+ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 
-# cuobjclient.h -> cufile.h -> cuda.h. The cuObject CppExtension only
-# includes /opt/cuobject/include, not /usr/local/cuda/include. Symlink
-# cuda.h (and cudaTypedefs.h which cuda.h may pull) into the SDK dir
-# so the compiler can resolve the transitive include.
-RUN for h in cuda.h cudaTypedefs.h; do \
-        if [ -f /usr/local/cuda/include/$h ] && [ ! -f ${CUOBJECT_PREFIX}/include/$h ]; then \
-            ln -s /usr/local/cuda/include/$h ${CUOBJECT_PREFIX}/include/$h; \
-        fi; \
-    done \
-    && echo "Symlinked CUDA headers into ${CUOBJECT_PREFIX}/include/" \
-    && ls -la ${CUOBJECT_PREFIX}/include/cuda*.h
+#################### cuObjClient SDK ####################
+# Install only the cuObjClient header and library from NVIDIA's
+# redistributable into CUDA_HOME so setup.py finds them automatically.
+# This does not change the base CUDA version -- it just adds two files.
 
-# ---------------------------------------------------------------------------
-# Stage 2: Install LMCache from source with cuObject extension
-#
-# CUOBJECT_INCLUDE_DIR / CUOBJECT_LIB_DIR point at the extracted SDK.
-# CUDA_HOME stays at the base image's CUDA (used by PyTorch extensions).
-# The cuObject pybind11 extension (lmcache_cuobject) is a CppExtension,
-# not a CUDAExtension, so it only needs the C++ compiler + cuobjclient.h.
-# ---------------------------------------------------------------------------
-ARG LMCACHE_REPO=https://github.com/realAaronWu/LMCache.git
-ARG LMCACHE_BRANCH=feature-S3-over-RDMA-support
+ARG NVIDIA_REDIST=https://developer.download.nvidia.com/compute/cuda/redist
+ARG CUOBJCLIENT_TAR=libcuobjclient/linux-x86_64/libcuobjclient-linux-x86_64-1.0.0.26-archive.tar.xz
 
-WORKDIR /opt
+RUN wget -q "${NVIDIA_REDIST}/${CUOBJCLIENT_TAR}" -O /tmp/sdk.tar.xz \
+    && tar -xf /tmp/sdk.tar.xz -C /tmp \
+    && cp /tmp/libcuobjclient-*/include/* /usr/local/cuda/include/ \
+    && cp -a /tmp/libcuobjclient-*/lib/* /usr/local/cuda/lib64/ \
+    && rm -rf /tmp/sdk.tar.xz /tmp/libcuobjclient-* \
+    && ls /usr/local/cuda/include/cuobjclient.h \
+    && echo "cuObjClient SDK installed into CUDA_HOME"
 
-RUN git clone --depth 1 --branch ${LMCACHE_BRANCH} ${LMCACHE_REPO} /opt/lmcache
+#################### vLLM + LMCache + cuObject (Build) ####################
 
-WORKDIR /opt/lmcache
+FROM base AS image-build
 
-# Build LMCache with cuObject extension
-# Use hardcoded paths -- ARG values are not available in ENV substitution
-ENV CUOBJECT_INCLUDE_DIR=/opt/cuobject/include
-ENV CUOBJECT_LIB_DIR=/opt/cuobject/lib
-# Set LD_LIBRARY_PATH now so the import verification can find libcuobjclient.so
-ENV LD_LIBRARY_PATH="/opt/cuobject/lib:${LD_LIBRARY_PATH}"
+COPY ./requirements/build.txt build.txt
 
-# Debug: verify SDK is reachable before build
-RUN echo "CUOBJECT_INCLUDE_DIR=${CUOBJECT_INCLUDE_DIR}" \
-    && echo "CUOBJECT_LIB_DIR=${CUOBJECT_LIB_DIR}" \
-    && ls -la ${CUOBJECT_INCLUDE_DIR}/cuobjclient.h \
-    && ls -la ${CUOBJECT_LIB_DIR}/
+ARG max_jobs=2
+ENV MAX_JOBS=${max_jobs}
 
-RUN pip install --no-cache-dir -e . --no-build-isolation \
-    && python3 -c "import torch; from lmcache.lmcache_cuobject import CuObjectClient; print('cuObject extension: OK')" \
-    && echo "LMCache installed successfully with cuObject support"
+ARG nvcc_threads=8
+ENV NVCC_THREADS=$nvcc_threads
 
-# ---------------------------------------------------------------------------
-# Runtime environment
-# ---------------------------------------------------------------------------
+ARG VLLM_VERSION=nightly
 
-# Default LMCache settings (can be overridden at runtime)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    . /opt/venv/bin/activate && \
+    uv pip install -r build.txt
+
+ARG LMCACHE_COMMIT_ID=1
+
+COPY . /workspace/LMCache
+WORKDIR /workspace/LMCache
+
+RUN --mount=type=cache,target=/root/.cache/ccache,id=ccache \
+    --mount=type=cache,target=/root/.cache/uv,id=uv-cache,sharing=locked \
+    . /opt/venv/bin/activate && \
+    if [ "$VLLM_VERSION" = "nightly" ]; then \
+        uv pip install --prerelease=allow \
+            'vllm[runai,tensorizer,flashinfer]' \
+            'triton-kernels @ git+https://github.com/triton-lang/triton.git@v3.5.0#subdirectory=python/triton_kernels' \
+            --extra-index-url https://wheels.vllm.ai/nightly \
+            --index-strategy unsafe-best-match ; \
+    else \
+        uv pip install --prerelease=allow \
+            "vllm[runai,tensorizer,flashinfer]==${VLLM_VERSION}" \
+            'triton-kernels @ git+https://github.com/triton-lang/triton.git@v3.5.0#subdirectory=python/triton_kernels' ; \
+    fi && \
+    python3 -c 'import torch; print("TORCH=", torch.__version__)' && \
+    python3 setup.py bdist_wheel --dist-dir=dist_lmcache && \
+    uv pip install ./dist_lmcache/*.whl --verbose && \
+    python3 -c "import torch; from lmcache.lmcache_cuobject import CuObjectClient; print('cuObject extension: OK')"
+
 ENV PYTHONHASHSEED=0
 ENV LMCACHE_MAX_LOCAL_CPU_SIZE=66
 
 WORKDIR /workspace
-
-COPY entrypoint.sh /entrypoint.sh
+COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
-
 ENTRYPOINT ["/entrypoint.sh"]
