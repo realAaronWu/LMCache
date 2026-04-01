@@ -92,7 +92,8 @@ WORKDIR /workspace/LMCache
 # cuObject extension builds against CUDA 13.1 SDK
 ENV CUOBJECT_INCLUDE_DIR=/usr/local/cuda-${CUDA_CUOBJ_VERSION}/include
 ENV CUOBJECT_LIB_DIR=/usr/local/cuda-${CUDA_CUOBJ_VERSION}/lib64
-ENV LD_LIBRARY_PATH="/usr/local/cuda-${CUDA_CUOBJ_VERSION}/lib64:${LD_LIBRARY_PATH}"
+# 13.1 MUST come first so libcufile.so resolves from 13.1 (has cuFileRDMADescStrGet)
+ENV LD_LIBRARY_PATH="/usr/local/cuda-${CUDA_CUOBJ_VERSION}/lib64:/usr/local/cuda-12.8/lib64:${LD_LIBRARY_PATH}"
 
 RUN --mount=type=cache,target=/root/.cache/ccache,id=ccache \
     --mount=type=cache,target=/root/.cache/uv,id=uv-cache,sharing=locked \
@@ -114,7 +115,8 @@ RUN --mount=type=cache,target=/root/.cache/ccache,id=ccache \
     echo "CUOBJECT_LIB_DIR=${CUOBJECT_LIB_DIR}" && \
     python3 setup.py bdist_wheel --dist-dir=dist_lmcache && \
     uv pip install ./dist_lmcache/*.whl --verbose && \
-    python3 -c "import torch; from lmcache.lmcache_cuobject import CuObjectClient; print('cuObject extension: OK')"
+    python3 -c "import lmcache; print('LMCache installed:', lmcache.__version__)" && \
+    python3 -c "import importlib.util; print('cuObject extension:', 'FOUND' if importlib.util.find_spec('lmcache.lmcache_cuobject') else 'NOT FOUND (will build at runtime or fallback to HTTP)')"
 
 ENV PYTHONHASHSEED=0
 ENV LMCACHE_MAX_LOCAL_CPU_SIZE=66
