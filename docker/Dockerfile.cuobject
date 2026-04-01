@@ -87,8 +87,15 @@ RUN git clone --depth 1 --branch ${LMCACHE_BRANCH} ${LMCACHE_REPO} /opt/lmcache
 WORKDIR /opt/lmcache
 
 # Build LMCache with cuObject extension
-ENV CUOBJECT_INCLUDE_DIR=${CUOBJECT_PREFIX}/include
-ENV CUOBJECT_LIB_DIR=${CUOBJECT_PREFIX}/lib
+# Use hardcoded paths -- ARG values are not available in ENV substitution
+ENV CUOBJECT_INCLUDE_DIR=/opt/cuobject/include
+ENV CUOBJECT_LIB_DIR=/opt/cuobject/lib
+
+# Debug: verify SDK is reachable before build
+RUN echo "CUOBJECT_INCLUDE_DIR=${CUOBJECT_INCLUDE_DIR}" \
+    && echo "CUOBJECT_LIB_DIR=${CUOBJECT_LIB_DIR}" \
+    && ls -la ${CUOBJECT_INCLUDE_DIR}/cuobjclient.h \
+    && ls -la ${CUOBJECT_LIB_DIR}/
 
 RUN pip install --no-cache-dir -e . --no-build-isolation \
     && python3 -c "import torch; from lmcache.lmcache_cuobject import CuObjectClient; print('cuObject extension: OK')" \
@@ -99,7 +106,7 @@ RUN pip install --no-cache-dir -e . --no-build-isolation \
 # ---------------------------------------------------------------------------
 
 # Ensure libcuobjclient.so is findable at runtime
-ENV LD_LIBRARY_PATH="${CUOBJECT_PREFIX}/lib:${LD_LIBRARY_PATH}"
+ENV LD_LIBRARY_PATH="/opt/cuobject/lib:${LD_LIBRARY_PATH}"
 
 # Default LMCache settings (can be overridden at runtime)
 ENV PYTHONHASHSEED=0
