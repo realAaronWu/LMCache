@@ -77,8 +77,8 @@ RUN test -f ${CUOBJECT_PREFIX}/include/cuobjclient.h \
 # The cuObject pybind11 extension (lmcache_cuobject) is a CppExtension,
 # not a CUDAExtension, so it only needs the C++ compiler + cuobjclient.h.
 # ---------------------------------------------------------------------------
-ARG LMCACHE_REPO=https://github.com/LMCache/LMCache.git
-ARG LMCACHE_BRANCH=dev
+ARG LMCACHE_REPO=https://github.com/realAaronWu/LMCache.git
+ARG LMCACHE_BRANCH=feature-S3-over-RDMA-support
 
 WORKDIR /opt
 
