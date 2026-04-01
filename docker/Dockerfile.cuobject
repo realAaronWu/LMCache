@@ -109,13 +109,26 @@ RUN --mount=type=cache,target=/root/.cache/ccache,id=ccache \
             "vllm[runai,tensorizer,flashinfer]==${VLLM_VERSION}" \
             'triton-kernels @ git+https://github.com/triton-lang/triton.git@v3.5.0#subdirectory=python/triton_kernels' ; \
     fi && \
-    python3 -c 'import torch; print("TORCH=", torch.__version__)' && \
+    python3 -c 'import torch; print("TORCH=", torch.__version__)'
+
+# Replace PyTorch's bundled libcufile.so (12.8, no RDMA symbols) with
+# the CUDA 13.1 version (has cuFileRDMADescStrGet needed by cuObjClient).
+# PyTorch's RPATH resolves libcufile from its pip package directory before
+# LD_LIBRARY_PATH, so the only way to override it is to replace in-place.
+ARG CUDA_CUOBJ_VERSION
+RUN TORCH_CUFILE_DIR=$(python3 -c "import nvidia.cufile; import os; print(os.path.dirname(nvidia.cufile.__file__))")/lib \
+    && echo "Replacing PyTorch cufile at ${TORCH_CUFILE_DIR} with CUDA 13.1 version" \
+    && ls -la ${TORCH_CUFILE_DIR}/libcufile* \
+    && cp -a /usr/local/cuda-${CUDA_CUOBJ_VERSION}/lib64/libcufile*.so* ${TORCH_CUFILE_DIR}/ \
+    && ls -la ${TORCH_CUFILE_DIR}/libcufile*
+
+RUN . /opt/venv/bin/activate && \
     echo "CUDA_HOME=${CUDA_HOME}" && \
     echo "CUOBJECT_INCLUDE_DIR=${CUOBJECT_INCLUDE_DIR}" && \
     echo "CUOBJECT_LIB_DIR=${CUOBJECT_LIB_DIR}" && \
     python3 setup.py bdist_wheel --dist-dir=dist_lmcache && \
     uv pip install ./dist_lmcache/*.whl --verbose && \
-    python3 -c "import importlib.util; print('cuObject extension:', 'FOUND' if importlib.util.find_spec('lmcache.lmcache_cuobject') else 'NOT FOUND')"
+    python3 -c "import torch; from lmcache.lmcache_cuobject import CuObjectClient; print('cuObject extension: OK')"
 
 ENV PYTHONHASHSEED=0
 ENV LMCACHE_MAX_LOCAL_CPU_SIZE=66
