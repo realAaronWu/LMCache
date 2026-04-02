@@ -110,7 +110,6 @@ RUN --mount=type=cache,target=/root/.cache/ccache,id=ccache \
             'triton-kernels @ git+https://github.com/triton-lang/triton.git@v3.5.0#subdirectory=python/triton_kernels' ; \
     fi && \
     python3 -c 'import torch; print("TORCH=", torch.__version__)'
-
 # Replace PyTorch's bundled libcufile.so (12.8, no RDMA symbols) with
 # the CUDA 13.1 version (has cuFileRDMADescStrGet needed by cuObjClient).
 # PyTorch's RPATH resolves libcufile from its pip package directory before
@@ -120,7 +119,9 @@ RUN TORCH_CUFILE_DIR=$(python3 -c "import nvidia.cufile; import os; print(os.pat
     && echo "Replacing PyTorch cufile at ${TORCH_CUFILE_DIR} with CUDA 13.1 version" \
     && ls -la ${TORCH_CUFILE_DIR}/libcufile* \
     && cp -a /usr/local/cuda-${CUDA_CUOBJ_VERSION}/lib64/libcufile*.so* ${TORCH_CUFILE_DIR}/ \
-    && ls -la ${TORCH_CUFILE_DIR}/libcufile*
+    && ls -la ${TORCH_CUFILE_DIR}/libcufile* \
+
+ENV CUFILE_ENV_PATH_JSON=/workspace/cufile.json
 
 RUN . /opt/venv/bin/activate && \
     echo "CUDA_HOME=${CUDA_HOME}" && \
