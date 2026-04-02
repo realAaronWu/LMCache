@@ -65,6 +65,7 @@ class CuObjectS3ConnectorAdapter(ConnectorAdapter):
 
         # cuObject-specific config
         cuobj_nic_device = extra_config.get("cuobj_nic_device", None)
+        s3_bucket = extra_config.get("s3_bucket", None)
 
         if context.metadata is None:
             raise ValueError("metadata is required for CuObjectS3Connector")
@@ -91,4 +92,5 @@ class CuObjectS3ConnectorAdapter(ConnectorAdapter):
             aws_access_key_id=aws_access_key_id,
             aws_secret_access_key=aws_secret_access_key,
             cuobj_nic_device=cuobj_nic_device,
+            s3_bucket=s3_bucket,
         )

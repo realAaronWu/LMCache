@@ -90,6 +90,7 @@ class CuObjectS3Connector(S3Connector):
         aws_access_key_id: Optional[str] = None,
         aws_secret_access_key: Optional[str] = None,
         cuobj_nic_device: Optional[str] = None,
+        s3_bucket: Optional[str] = None,
     ):
         # Initialise the parent S3Connector (CRT client, auth, etc.)
         super().__init__(
@@ -103,6 +104,7 @@ class CuObjectS3Connector(S3Connector):
             disable_tls=disable_tls,
             aws_access_key_id=aws_access_key_id,
             aws_secret_access_key=aws_secret_access_key,
+            s3_bucket=s3_bucket,
         )
 
         # -- cuObject initialisation -----------------------------------------
