@@ -8,14 +8,14 @@
 set -euo pipefail
 
 # ---- Env defaults (override via docker run -e) ----------------------------
-: "${MODEL:=Qwen/Qwen3-4B-Instruct-2507}"
+: "${MODEL:=meta-llama/Llama-3.1-8B-Instruct}"
 : "${PORT:=8000}"
 : "${TP_SIZE:=1}"
-: "${LOAD_FORMAT:=dummy}"
+: "${LOAD_FORMAT:=auto}"
 : "${KV_CONNECTOR:=LMCacheConnectorV1}"
 : "${KV_ROLE:=kv_both}"
 : "${PYTHONHASHSEED:=0}"
-: "${LMCACHE_MAX_LOCAL_CPU_SIZE:=66}"
+: "${LMCACHE_MAX_LOCAL_CPU_SIZE:=2}"
 
 export PYTHONHASHSEED
 export LMCACHE_MAX_LOCAL_CPU_SIZE

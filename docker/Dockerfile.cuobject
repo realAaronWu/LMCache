@@ -130,9 +130,6 @@ RUN . /opt/venv/bin/activate && \
     uv pip install ./dist_lmcache/*.whl --verbose && \
     python3 -c "import torch; from lmcache.lmcache_cuobject import CuObjectClient; print('cuObject extension: OK')"
 
-ENV PYTHONHASHSEED=0
-ENV LMCACHE_MAX_LOCAL_CPU_SIZE=66
-
 WORKDIR /workspace
 RUN cp /workspace/LMCache/docker/entrypoint.sh /entrypoint.sh \
     && chmod +x /entrypoint.sh
