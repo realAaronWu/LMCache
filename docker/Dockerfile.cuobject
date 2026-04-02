@@ -119,7 +119,7 @@ RUN TORCH_CUFILE_DIR=$(python3 -c "import nvidia.cufile; import os; print(os.pat
     && echo "Replacing PyTorch cufile at ${TORCH_CUFILE_DIR} with CUDA 13.1 version" \
     && ls -la ${TORCH_CUFILE_DIR}/libcufile* \
     && cp -a /usr/local/cuda-${CUDA_CUOBJ_VERSION}/lib64/libcufile*.so* ${TORCH_CUFILE_DIR}/ \
-    && ls -la ${TORCH_CUFILE_DIR}/libcufile* \
+    && ls -la ${TORCH_CUFILE_DIR}/libcufile*
 
 ENV CUFILE_ENV_PATH_JSON=/workspace/cufile.json
 
