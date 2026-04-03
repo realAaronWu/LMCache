@@ -9,7 +9,7 @@
         "max_device_pinned_mem_size_kb": 33554432,
         "allow_compat_mode": true,
         "gds_rdma_write_support": true,
-        "rdma_dev_addr_list": ["mlx5_0", "mlx5_1", "mlx5_2", "mlx5_3"],
+        "rdma_dev_addr_list": ["100.68.213.31"],
         "rdma_load_balancing_policy": "RoundRobin"
     }
 }
