@@ -217,7 +217,7 @@ class CuObjClientWrapper:
         # -- 2. Numeric error code ----------------------------------------
         try:
             code = int(stripped)
-            if code == CU_OBJ_SUCCESS:
+            if code == CU_OBJ_SUCCESS or code in (200, 201, 206):
                 return True
             logger.warning(f"RDMA reply error code: {code}")
             return False

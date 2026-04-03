@@ -20,7 +20,10 @@ from lmcache.v1.storage_backend.connector.cuobject_bindings import (
     CuObjClientWrapper,
     CuObjConfig,
 )
-from lmcache.v1.storage_backend.connector.s3_connector import S3Connector
+from lmcache.v1.storage_backend.connector.s3_connector import (
+    MemoryViewStream,
+    S3Connector,
+)
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 
 logger = init_logger(__name__)
@@ -180,8 +183,14 @@ class CuObjectS3Connector(S3Connector):
         headers.add("Content-Length", str(data_size))
         headers.add("x-amz-rdma-token", rdma_token)
 
-        req = HttpRequest("PUT", self._format_safe_path(key_str), headers)
-        # No body_stream — data is transferred via server-initiated RDMA_READ
+        # CRT 0.32+ asserts synchronous_stream even for DEFAULT type.
+        # Provide an empty stream to satisfy the assertion.
+        empty_stream = MemoryViewStream(b"")
+        req = HttpRequest(
+            "PUT", self._format_safe_path(key_str), headers,
+            body_stream=empty_stream,
+        )
+        # Actual data is transferred via server-initiated RDMA_READ — data is transferred via server-initiated RDMA_READ
 
         # Track RDMA reply from response headers
         rdma_state = {"reply": None, "err": None, "status": None}
