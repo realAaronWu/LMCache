@@ -176,16 +176,17 @@ class CuObjectS3Connector(S3Connector):
         # Prepare RDMA token (sub-region within the registered pool)
         rdma_token = self._cuobj_client.prepare_put(memory_obj.data_ptr, data_size)
 
+        fake_bytes = b"xrdma"
         # Build HTTP headers
         headers = HttpHeaders()
         headers.add("Host", self.s3_endpoint)
         headers.add("Content-Type", "application/octet-stream")
-        headers.add("Content-Length", str(data_size))
+        headers.add("Content-Length", str(len(fake_bytes)))
         headers.add("x-amz-rdma-token", rdma_token)
 
         # CRT 0.32+ asserts synchronous_stream even for DEFAULT type.
         # Provide an empty stream to satisfy the assertion.
-        empty_stream = MemoryViewStream(b"")
+        empty_stream = MemoryViewStream(fake_bytes)
         req = HttpRequest(
             "PUT", self._format_safe_path(key_str), headers,
             body_stream=empty_stream,
