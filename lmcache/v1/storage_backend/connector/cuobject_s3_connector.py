@@ -186,11 +186,13 @@ class CuObjectS3Connector(S3Connector):
         # Track RDMA reply from response headers
         rdma_state = {"reply": None, "err": None, "status": None}
 
-        def on_headers(status_code, resp_headers, **kwargs):
-            rdma_state["status"] = status_code
-            for name, value in resp_headers:
+        def on_headers(**kwargs):
+            rdma_state["status"] = kwargs.get("status_code")
+            logger.debug(f"_rdma_upload status: {rdma_state["status"]}")
+            for name, value in kwargs.get("headers", []):
                 if name.lower() == "x-amz-rdma-reply":
                     rdma_state["reply"] = value
+                    logger.debug(f"_rdma_upload reply: {value}")
 
         def on_done(error=None, status_code=None, **kwargs):
             rdma_state["err"] = error
@@ -201,12 +203,15 @@ class CuObjectS3Connector(S3Connector):
                     f"error={rdma_state['err']}, status={final_status}"
                 )
             # Verify RDMA completion
-            if rdma_state["reply"]:
-                if not self._cuobj_client.parse_rdma_reply(rdma_state["reply"]):
-                    raise RuntimeError(
-                        f"RDMA upload verification failed for {key_str}: "
-                        f"reply={rdma_state['reply']!r}"
-                    )
+            if rdma_state["reply"] is None:
+                raise RuntimeError(
+                    f"RDMA upload missing x-amz-rdma-reply for {key_str}"
+                )
+            if not self._cuobj_client.parse_rdma_reply(rdma_state["reply"]):
+                raise RuntimeError(
+                    f"RDMA upload verification failed for {key_str}: "
+                    f"reply={rdma_state['reply']!r}"
+                )
 
         s3_req = s3.S3Request(
             client=self.s3_client,
@@ -262,9 +267,9 @@ class CuObjectS3Connector(S3Connector):
 
         rdma_state = {"reply": None, "err": None, "status": None}
 
-        def on_headers(status_code, resp_headers, **kwargs):
-            rdma_state["status"] = status_code
-            for name, value in resp_headers:
+        def on_headers(**kwargs):
+            rdma_state["status"] = kwargs.get("status_code")
+            for name, value in kwargs.get("headers", []):
                 if name.lower() == "x-amz-rdma-reply":
                     rdma_state["reply"] = value
 
@@ -277,12 +282,15 @@ class CuObjectS3Connector(S3Connector):
                     f"RDMA download failed for {key_str}: "
                     f"error={rdma_state['err']}, status={final_status}"
                 )
-            if rdma_state["reply"]:
-                if not self._cuobj_client.parse_rdma_reply(rdma_state["reply"]):
-                    raise RuntimeError(
-                        f"RDMA download verification failed for "
-                        f"{key_str}: reply={rdma_state['reply']!r}"
-                    )
+            if rdma_state["reply"] is None:
+                raise RuntimeError(
+                    f"RDMA download missing x-amz-rdma-reply for {key_str}"
+                )
+            if not self._cuobj_client.parse_rdma_reply(rdma_state["reply"]):
+                raise RuntimeError(
+                    f"RDMA download verification failed for "
+                    f"{key_str}: reply={rdma_state['reply']!r}"
+                )
 
         # No on_body — data arrives via RDMA_WRITE, not HTTP body
         s3_req = s3.S3Request(
