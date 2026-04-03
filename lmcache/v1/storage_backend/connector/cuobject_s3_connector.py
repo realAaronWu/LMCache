@@ -190,6 +190,7 @@ class CuObjectS3Connector(S3Connector):
             rdma_state["status"] = kwargs.get("status_code")
             logger.debug(f"_rdma_upload status: {rdma_state["status"]}")
             for name, value in kwargs.get("headers", []):
+                logger.debug(f"_rdma_upload {name}: {value}")
                 if name.lower() == "x-amz-rdma-reply":
                     rdma_state["reply"] = value
                     logger.debug(f"_rdma_upload reply: {value}")
@@ -270,8 +271,10 @@ class CuObjectS3Connector(S3Connector):
         def on_headers(**kwargs):
             rdma_state["status"] = kwargs.get("status_code")
             for name, value in kwargs.get("headers", []):
+                logger.debug(f"_rdma_download {name}: {value}")
                 if name.lower() == "x-amz-rdma-reply":
                     rdma_state["reply"] = value
+                    logger.debug(f"_rdma_download reply: {value}")
 
         def on_done(error=None, status_code=None, **kwargs):
             rdma_state["err"] = error
