@@ -176,7 +176,7 @@ class CuObjectS3Connector(S3Connector):
         # Prepare RDMA token (sub-region within the registered pool)
         rdma_token = self._cuobj_client.prepare_put(memory_obj.data_ptr, data_size)
 
-        fake_bytes = b"xrdma"
+        fake_bytes = b""
         # Build HTTP headers
         headers = HttpHeaders()
         headers.add("Host", self.s3_endpoint)
