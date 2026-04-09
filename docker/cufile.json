@@ -1,0 +1,15 @@
+{
+    "logging": {
+        "level": "ERROR"
+    },
+    "properties": {
+        "max_direct_io_size_kb": 16384,
+        "max_device_cache_size_kb": 131072,
+        "per_buffer_cache_size_kb": 1024,
+        "max_device_pinned_mem_size_kb": 33554432,
+        "allow_compat_mode": true,
+        "gds_rdma_write_support": true,
+        "rdma_dev_addr_list": ["1.1.1.1"],
+        "rdma_load_balancing_policy": "RoundRobin"
+    }
+}
