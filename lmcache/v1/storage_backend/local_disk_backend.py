@@ -119,10 +119,36 @@ class LocalDiskBackend(StorageBackendInterface):
         self.disk_lock = threading.Lock()
 
         assert config.local_disk is not None
-        self.path: str = config.local_disk
-        if not os.path.exists(self.path):
-            os.makedirs(self.path)
-            logger.info(f"Created local disk cache directory: {self.path}")
+
+        # Multi-path support: parse comma-separated paths and select one
+        # based on the configured sharding strategy.
+        paths = [p.strip() for p in config.local_disk.split(",") if p.strip()]
+        assert len(paths) > 0, "At least one disk path must be provided"
+
+        self.local_disk_path_sharding = config.local_disk_path_sharding
+        assert self.local_disk_path_sharding == "by_gpu", (
+            f"Unsupported local_disk_path_sharding "
+            f"'{self.local_disk_path_sharding}'. "
+            "Only 'by_gpu' is supported currently."
+        )
+
+        # Extract device index from dst_device (e.g. "cuda:2" -> 2)
+        device_id = (
+            int(dst_device.split(":")[1])
+            if ":" in dst_device
+            else (torch.cuda.current_device() if torch.cuda.is_available() else 0)
+        )
+        self.path: str = paths[device_id % len(paths)]
+
+        # Create all directories (not just the selected one)
+        for p in paths:
+            os.makedirs(p, exist_ok=True)
+        logger.info(
+            "Local disk cache path: %s (device %s, %d path(s) configured)",
+            self.path,
+            dst_device,
+            len(paths),
+        )
 
         self.loop = loop
 
@@ -168,7 +194,7 @@ class LocalDiskBackend(StorageBackendInterface):
         else:
             logger.warning("Controller message sender is not initialized")
 
-    def __str__(self):
+    def __str__(self) -> str:
         return "LocalDiskBackend"
 
     def _key_to_path(
@@ -336,11 +362,11 @@ class LocalDiskBackend(StorageBackendInterface):
                 all_evict_keys.extend(evict_keys)
             if evict_success:
                 self.current_cache_size += required_size
+                self.cache_policy.update_on_put(key)
 
         if not evict_success:
             return None
 
-        self.cache_policy.update_on_put(key)
         memory_obj.ref_count_up()
 
         asyncio.run_coroutine_threadsafe(
@@ -635,7 +661,7 @@ class LocalDiskBackend(StorageBackendInterface):
             f"Bandwidth: {size / disk_read_time / 1e6:.2f} MB/s"
         )
 
-    def get_allocator_backend(self):
+    def get_allocator_backend(self) -> LocalCPUBackend:
         return self.local_cpu_backend
 
     def close(self) -> None:
