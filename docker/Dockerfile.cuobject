@@ -115,8 +115,10 @@ RUN --mount=type=cache,target=/root/.cache/ccache,id=ccache \
 # PyTorch's RPATH resolves libcufile from its pip package directory before
 # LD_LIBRARY_PATH, so the only way to override it is to replace in-place.
 ARG CUDA_CUOBJ_VERSION
+RUN . /opt/venv/bin/activate && \
+    uv pip install nvidia-cufile-cu12
 RUN TORCH_CUFILE_DIR=$(python3 -c "import nvidia.cufile; import os; print(os.path.dirname(nvidia.cufile.__file__))")/lib \
-    && echo "Replacing PyTorch cufile at ${TORCH_CUFILE_DIR} with CUDA 13.1 version" \
+    && echo "Replacing PyTorch cufile at ${TORCH_CUFILE_DIR} with CUDA ${CUDA_CUOBJ_VERSION} version" \
     && ls -la ${TORCH_CUFILE_DIR}/libcufile* \
     && cp -a /usr/local/cuda-${CUDA_CUOBJ_VERSION}/lib64/libcufile*.so* ${TORCH_CUFILE_DIR}/ \
     && ls -la ${TORCH_CUFILE_DIR}/libcufile*
