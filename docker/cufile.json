@@ -1,0 +1,12 @@
+{
+    "logging": {
+        "level": "ERROR"
+    },
+    "properties": {
+        "allow_compat_mode": true,
+        "use_pci_p2pdma": true,
+        "rdma_peer_type": "dmabuf",
+        "rdma_dev_addr_list": ["1.1.1.1"],
+        "rdma_load_balancing_policy": "RoundRobin"
+    }
+}
