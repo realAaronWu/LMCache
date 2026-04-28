@@ -56,6 +56,7 @@ ENV CUDA_HOME=/usr/local/cuda-${CUDA_VERSION}
 WORKDIR /workspace
 
 COPY ./requirements/common.txt common.txt
+COPY ./requirements/cuda_core.txt cuda_core.txt
 COPY ./requirements/cuda.txt cuda.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     . /opt/venv/bin/activate && \
