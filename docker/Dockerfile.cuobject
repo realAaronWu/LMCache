@@ -89,8 +89,9 @@ RUN git clone --recurse-submodules --depth 1 --shallow-submodules \
 #   - aws-cpp-sdk-s3, aws-cpp-sdk-s3-crt, aws-cpp-sdk-core (built above)
 #   - cuobjclient-13.1 (from CUDA 13.1 toolkit, found via pkg-config)
 #
-# NIXL is built and installed before cuda.txt so that the "nixl" dependency
-# in common.txt is already satisfied and uv does not try to fetch from PyPI.
+# NIXL native libs + plugins are built here; the Python wheel is built but
+# NOT installed until after vLLM (which pulls PyPI nixl-cu12 as a dep).
+# Our custom wheel is force-reinstalled post-vLLM to overwrite the PyPI copy.
 # ---------------------------------------------------------------------------
 ARG NIXL_REPO=https://github.com/ai-dynamo/nixl.git
 ARG NIXL_BRANCH=main
@@ -125,31 +126,43 @@ RUN echo "${NIXL_PREFIX}/lib/x86_64-linux-gnu" > /etc/ld.so.conf.d/nixl.conf \
     && echo "Installed plugins:" \
     && ls -1 ${NIXL_PREFIX}/lib/x86_64-linux-gnu/plugins/
 
-# Build and install Python wheels
+# Build Python wheel (but do NOT install yet).
+# Keep the default name "nixl-cu12" — do NOT rename to nixl-cu13.
+# vLLM declares nixl as a dependency and will pull nixl-cu12 from PyPI.
+# We force-reinstall our custom wheel AFTER vLLM to overwrite the PyPI
+# version with one whose libnixl.so knows about the OBJ plugin.
 RUN . /opt/venv/bin/activate \
-    && cd /tmp/nixl-src \
-    && if [ -f ./contrib/tomlutil.py ]; then \
-        python3 ./contrib/tomlutil.py --wheel-name nixl-cu13 pyproject.toml; \
-    fi \
     && mkdir -p /tmp/nixl-wheels \
     && uv build /tmp/nixl-src --wheel --out-dir /tmp/nixl-wheels --python 3.12 \
-    && uv pip install /tmp/nixl-wheels/nixl_cu13*.whl --force-reinstall --no-deps \
-    && NIXL_META_DIR="/tmp/nixl-build/src/bindings/python/nixl-meta" \
-    && if [ -d "${NIXL_META_DIR}" ]; then \
-        uv build "${NIXL_META_DIR}" --wheel --out-dir /tmp/nixl-wheels --python 3.12 \
-        && uv pip install /tmp/nixl-wheels/nixl-*.whl --force-reinstall --no-deps; \
-    fi
+        -Csetup-args="-Dcudapath_lib=${CUDA_HOME}/lib64" \
+        -Csetup-args="-Dcudapath_inc=${CUDA_HOME}/include" \
+    && ls -1 /tmp/nixl-wheels/ \
+    && echo "Custom nixl-cu12 wheel built (will be installed after vLLM)"
 
-# NIXL runtime library paths
-ENV LD_LIBRARY_PATH="${NIXL_PREFIX}/lib/x86_64-linux-gnu:${NIXL_PREFIX}/lib/x86_64-linux-gnu/plugins:${LD_LIBRARY_PATH:-}"
+# Verify the native OBJ plugin was built with cuobjclient (RDMA acceleration).
+# Plugins are NOT inside the Python wheel — they're loaded at runtime from the
+# native install at NIXL_PREFIX via LD_LIBRARY_PATH.
+RUN OBJ_PLUGIN="${NIXL_PREFIX}/lib/x86_64-linux-gnu/plugins/libplugin_OBJ.so" \
+    && echo "Checking OBJ plugin at: ${OBJ_PLUGIN}" \
+    && ldd "${OBJ_PLUGIN}" | grep cuobjclient \
+    && echo "cuobjclient linked: OK (RDMA acceleration enabled)" \
+    || (echo "ERROR: OBJ plugin missing cuobjclient linkage — RDMA acceleration will NOT work!" \
+        && echo "ldd output:" && ldd "${OBJ_PLUGIN}" && exit 1)
+
+# Tell nixl to load plugins from the native build (not relative to the Python .so)
+ENV NIXL_PLUGIN_DIR="${NIXL_PREFIX}/lib/x86_64-linux-gnu/plugins"
+
+# NIXL runtime library paths (include CUDA 13.1 for libcuobjclient.so)
+ENV LD_LIBRARY_PATH="${NIXL_PREFIX}/lib/x86_64-linux-gnu:${NIXL_PREFIX}/lib/x86_64-linux-gnu/plugins:/usr/local/cuda-${CUDA_CUOBJ_VERSION}/lib64:${LD_LIBRARY_PATH:-}"
 
 WORKDIR /workspace
 
 COPY ./requirements/common.txt common.txt
 COPY ./requirements/cuda.txt cuda.txt
-# NIXL is already installed from source above (nixl-cu13 + nixl meta-package).
-# Filter out the "nixl" line from common.txt so uv does not try to resolve it
-# from PyPI (where nixl-cu12 1.0.1 does not exist for our custom build).
+COPY ./requirements/cuda_core.txt cuda_core.txt
+# Filter out the "nixl" line from common.txt so cuda.txt does not pull nixl
+# from PyPI during the base stage.  Our custom nixl-cu12 wheel is installed
+# later (after vLLM) to overwrite whatever PyPI version vLLM brings in.
 RUN sed -i '/^nixl/d' common.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     . /opt/venv/bin/activate && \
@@ -204,6 +217,16 @@ RUN --mount=type=cache,target=/root/.cache/ccache,id=ccache \
             'triton-kernels @ git+https://github.com/triton-lang/triton.git@v3.5.0#subdirectory=python/triton_kernels' ; \
     fi && \
     python3 -c 'import torch; print("TORCH=", torch.__version__)'
+
+# ---- Overwrite PyPI nixl-cu12 with our custom-built wheel ----
+# vLLM just installed nixl-cu12 from PyPI (no OBJ plugin support).
+# Force-reinstall our custom wheel so _bindings.so and libnixl.so come from
+# the same source tree as the native-built plugins in NIXL_PLUGIN_DIR.
+RUN . /opt/venv/bin/activate && \
+    echo "Overwriting PyPI nixl-cu12 with custom build..." && \
+    uv pip install /tmp/nixl-wheels/nixl_cu12*.whl --force-reinstall --no-deps && \
+    python3 -c "import nixl_cu12, os; print('nixl_cu12 path:', nixl_cu12.__path__); plugin_dir = os.environ.get('NIXL_PLUGIN_DIR', ''); obj_plugin = os.path.join(plugin_dir, 'libplugin_OBJ.so'); assert os.path.exists(obj_plugin), f'OBJ plugin not at {obj_plugin}'; print('OBJ plugin verified:', obj_plugin); print('Custom nixl-cu12 installed OK')"
+
 # Replace PyTorch's bundled libcufile.so (12.8, no RDMA symbols) with
 # the CUDA 13.1 version (has cuFileRDMADescStrGet needed by cuObjClient).
 # PyTorch's RPATH resolves libcufile from its pip package directory before
