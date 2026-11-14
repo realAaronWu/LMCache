@@ -13,8 +13,10 @@ import sys
 import pytest
 
 # First Party
-from benchmarks.pooled_kv_routing.tests.test_workloads import spec as spec
+from benchmarks.pooled_kv_routing.tests import test_workloads
 from benchmarks.pooled_kv_routing.workloads import TraceSpec
+
+spec = test_workloads.spec
 
 
 def test_help_names_only_available_commands() -> None:
