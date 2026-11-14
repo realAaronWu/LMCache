@@ -3,6 +3,7 @@
 
 # Standard
 from pathlib import Path
+from typing import cast
 import asyncio
 import json
 
@@ -214,6 +215,27 @@ def test_uncertainty_is_idempotent_until_real_terminal_confirmation() -> None:
         assert not state.snapshot(100)[0].healthy
         with pytest.raises(ValueError):
             await runtime.finish(ProxyFinish("one", "A", "success", True))
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        ProxyFinish("one", cast(str, None), "error", False),
+        ProxyFinish("one", "A", "success", cast(bool, 1)),
+        ProxyFinish("one", "A", "error", cast(bool, "false")),
+        ProxyFinish(cast(str, None), "", "error", False),
+    ],
+)
+def test_invalid_callback_authority_does_not_mutate_work(result: ProxyFinish) -> None:
+    async def run() -> None:
+        runtime, state = components()
+        await runtime.route({"request_id": "one", "prompt": [1, 2], "max_tokens": 1})
+        before = state.snapshot(100)
+        with pytest.raises(ValueError):
+            await runtime.finish(result)
+        assert state.snapshot(100) == before
 
     asyncio.run(run())
 

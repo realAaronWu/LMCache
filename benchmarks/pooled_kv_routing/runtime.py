@@ -103,7 +103,8 @@ class RoutingRuntime:
             result: The proxy's exactly-once terminal callback.
 
         Raises:
-            ValueError: Duplicate confirmed terminal or inconsistent worker.
+            ValueError: Invalid identity/confirmation, owner mismatch or
+                duplicate confirmed terminal.
             KeyError: A selected request was never reserved.
 
         Notes:
@@ -111,6 +112,13 @@ class RoutingRuntime:
             evidence may release retained work but does not clear taint.
             An unselected failed route with no reservation is a no-op.
         """
+        if (
+            not isinstance(result.request_id, str)
+            or not result.request_id
+            or not isinstance(result.worker_id, str)
+            or type(result.worker_terminal_confirmed) is not bool
+        ):
+            raise ValueError("invalid completion identity or confirmation type")
         now = self._clock()
         if result.worker_terminal_confirmed:
             if not result.worker_id:
