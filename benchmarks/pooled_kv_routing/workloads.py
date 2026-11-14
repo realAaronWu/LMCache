@@ -234,6 +234,8 @@ def main(argv: list[str] | None = None) -> int:
     with all defaults explicit (ensure_ascii=True, allow_nan=False).
     Returns 0 or 1. Invalid input is diagnosed on
     stderr; argparse returns its usual exit 2 for invalid command grammar.
+    Output is exclusively created; existing paths, including input aliases,
+    are never overwritten.
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["generate"])
@@ -246,8 +248,10 @@ def main(argv: list[str] | None = None) -> int:
         trace = generate(TraceSpec(**json.loads(args.config.read_text())), args.seed)
         if trace.config_sha256 != args.config_sha256:
             raise ValueError("config SHA mismatch")
-        args.output.write_bytes(_canonical(asdict(trace)) + b"\n")
-    except (OSError, ValueError, TypeError, KeyError) as exc:
+        encoded = _canonical(asdict(trace)) + b"\n"
+        with args.output.open("xb") as stream:
+            stream.write(encoded)
+    except (OSError, ValueError, TypeError, KeyError, RecursionError) as exc:
         print(f"generate: {exc}", file=sys.stderr)
         return 1
     return 0

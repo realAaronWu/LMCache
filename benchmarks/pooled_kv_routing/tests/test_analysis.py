@@ -170,9 +170,10 @@ def test_paired_statistics_and_qualification_boundaries(tmp_path: Path) -> None:
     protocol, artifacts = packet(tmp_path)
     report = analysis.analyze(protocol, artifacts)
     assert report["evidence_status"] == "PASS"
-    assert report["acceptance"]["AC1"] == "PASS"
-    assert report["acceptance"]["AC3"] == "PASS"
-    assert report["acceptance"]["AC4"] == "PASS"
+    assert report["packet_checks"]["ttft_threshold"] == "PASS"
+    assert report["packet_checks"]["control_regressions"] == "PASS"
+    assert report["packet_checks"]["streaming"] == "PASS"
+    assert set(report["acceptance"].values()) == {"NOT RUN"}
     assert report["metrics"]["primary"]["ttft"]["estimate"] == pytest.approx(0.10)
     assert report["metrics"]["primary"]["ttft"]["lower"] == pytest.approx(0.10)
     assert report["overall_status"] == "NOT RUN"
@@ -180,13 +181,13 @@ def test_paired_statistics_and_qualification_boundaries(tmp_path: Path) -> None:
     assert report["acceptance"]["AC5"] == "NOT RUN"
 
 
-def test_valid_four_percent_is_performance_failure_not_bad_evidence(
+def test_four_percent_fails_packet_threshold_not_benchmark_qualification(
     tmp_path: Path,
 ) -> None:
     protocol, artifacts = packet(tmp_path, 0.04)
     report = analysis.analyze(protocol, artifacts)
     assert report["evidence_status"] == "PASS"
-    assert report["acceptance"]["AC1"] == "FAIL"
+    assert report["packet_checks"]["ttft_threshold"] == "FAIL"
 
 
 @pytest.mark.parametrize(
@@ -274,7 +275,10 @@ def test_controls_cannot_hide_missing_diagnostics(tmp_path: Path) -> None:
         if c["scenario"] not in ("low-load", "cost-observe")
     ]
     reseal(protocol, artifacts)
-    assert analysis.analyze(protocol, artifacts)["acceptance"]["AC3"] == "NOT RUN"
+    assert (
+        analysis.analyze(protocol, artifacts)["packet_checks"]["control_regressions"]
+        == "NOT RUN"
+    )
 
 
 def test_absent_control_is_not_run_and_unlisted_evidence_rejected(
@@ -283,7 +287,10 @@ def test_absent_control_is_not_run_and_unlisted_evidence_rejected(
     protocol, artifacts = packet(tmp_path)
     protocol["cases"] = [c for c in protocol["cases"] if c["scenario"] != "slow-path"]
     reseal(protocol, artifacts)
-    assert analysis.analyze(protocol, artifacts)["acceptance"]["AC3"] == "NOT RUN"
+    assert (
+        analysis.analyze(protocol, artifacts)["packet_checks"]["control_regressions"]
+        == "NOT RUN"
+    )
     (artifacts / "hidden.log").write_text("PASS")
     with pytest.raises(ValueError, match="unlisted"):
         analysis.analyze(protocol, artifacts)
@@ -338,7 +345,10 @@ def test_ratio_of_block_means_and_paired_interval_are_reproducible(
 
 def test_exact_five_percent_does_not_pass_strict_threshold(tmp_path: Path) -> None:
     protocol, artifacts = packet(tmp_path, 0.05)
-    assert analysis.analyze(protocol, artifacts)["acceptance"]["AC1"] == "FAIL"
+    assert (
+        analysis.analyze(protocol, artifacts)["packet_checks"]["ttft_threshold"]
+        == "FAIL"
+    )
 
 
 @pytest.mark.parametrize("metric", ["itl", "drain", "goodput"])
@@ -376,7 +386,7 @@ def test_streaming_drain_or_goodput_regression(tmp_path: Path, metric: str) -> N
         assert row["drain_s"] > 0
         assert row["throughput"] < 2 / 600
     else:
-        assert report["acceptance"]["AC4"] == "FAIL"
+        assert report["packet_checks"]["streaming"] == "FAIL"
 
 
 def test_background_class_remains_in_report(tmp_path: Path) -> None:
@@ -397,3 +407,128 @@ def test_frozen_balanced_order_not_forced_to_alternate(tmp_path: Path) -> None:
     reseal(protocol, artifacts)
     with pytest.raises(ValueError, match="unbalanced"):
         analysis.analyze(protocol, artifacts)
+
+
+def invoke_analysis(
+    protocol_path: Path, artifacts: Path, output: Path
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "benchmarks.pooled_kv_routing.analysis",
+            "--protocol",
+            str(protocol_path),
+            "--artifacts",
+            str(artifacts),
+            "--output",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.mark.parametrize("cohort", ["short-tokens", "no-background"])
+def test_cli_fixture_statistics_never_qualify_benchmark(
+    tmp_path: Path, cohort: str
+) -> None:
+    protocol, artifacts = packet(tmp_path)
+    if cohort == "no-background":
+        for case in protocol["cases"]:
+            case["requests"] = case["requests"][:1]
+        for path in artifacts.glob("*-*.json"):
+            data = json.loads(path.read_text())
+            data["records"] = data["records"][:1]
+            path.write_text(json.dumps(data))
+        reseal(protocol, artifacts)
+    source = tmp_path / "protocol.json"
+    source.write_text(json.dumps(protocol))
+    output = tmp_path / "report.json"
+    result = invoke_analysis(source, artifacts, output)
+    assert result.returncode == 2
+    report = json.loads(output.read_text())
+    assert set(report["acceptance"].values()) == {"NOT RUN"}
+    assert report["performance_status"] == "NOT RUN"
+    assert report["scope"] == "packet-statistics-only"
+    assert report["packet_checks"]["ttft_threshold"] == "PASS"
+
+
+@pytest.mark.parametrize(
+    "alias", ["protocol", "symlink", "hardlink", "arm-hardlink", "inventory-hardlink"]
+)
+def test_cli_preserves_protected_inputs(tmp_path: Path, alias: str) -> None:
+    protocol, artifacts = packet(tmp_path)
+    source = tmp_path / "protocol.json"
+    source.write_text(json.dumps(protocol))
+    target = (
+        artifacts / "primary-0-LEW.json"
+        if alias == "arm-hardlink"
+        else artifacts / "inventory.json"
+        if alias == "inventory-hardlink"
+        else source
+    )
+    before = target.read_bytes()
+    output = source if alias == "protocol" else tmp_path / "alias.json"
+    if alias == "symlink":
+        output.symlink_to(target)
+    elif "hardlink" in alias:
+        output.hardlink_to(target)
+    result = invoke_analysis(source, artifacts, output)
+    assert result.returncode == 1
+    assert target.read_bytes() == before
+    assert "output" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b'{"x":' + b"[" * 20000 + b"0" + b"]" * 20000 + b"}", b"\xff", b"{"],
+    ids=["depth", "unicode", "syntax"],
+)
+@pytest.mark.parametrize("location", ["protocol", "arm"])
+def test_cli_decoder_failure_replaces_stale_report(
+    tmp_path: Path, payload: bytes, location: str
+) -> None:
+    protocol, artifacts = packet(tmp_path)
+    source = tmp_path / "protocol.json"
+    source.write_text(json.dumps(protocol))
+    output = tmp_path / "result.json"
+    assert invoke_analysis(source, artifacts, output).returncode == 2
+    before = output.read_bytes()
+    if location == "protocol":
+        source.write_bytes(payload)
+    else:
+        inventory = json.loads((artifacts / "inventory.json").read_text())
+        item = inventory["files"][0]
+        (artifacts / item["path"]).write_bytes(payload)
+        item["sha256"] = hashlib.sha256(payload).hexdigest()
+        (artifacts / "inventory.json").write_text(json.dumps(inventory))
+    result = invoke_analysis(source, artifacts, output)
+    assert result.returncode == 1 and "Traceback" not in result.stderr
+    report = json.loads(output.read_text())
+    assert output.read_bytes() != before
+    assert report["evidence_status"] == report["overall_status"] == "FAIL"
+    assert report["diagnostics"]
+
+
+def test_cli_does_not_overwrite_unrelated_existing_file(tmp_path: Path) -> None:
+    protocol, artifacts = packet(tmp_path)
+    source = tmp_path / "protocol.json"
+    source.write_text(json.dumps(protocol))
+    output = tmp_path / "other.json"
+    output.write_text('{"licensed_corpus": "keep"}')
+    before = output.read_bytes()
+    assert invoke_analysis(source, artifacts, output).returncode == 1
+    assert output.read_bytes() == before
+
+
+def test_cli_never_refreshes_report_when_used_as_protocol(tmp_path: Path) -> None:
+    protocol, artifacts = packet(tmp_path)
+    source = tmp_path / "protocol.json"
+    source.write_text(json.dumps(protocol))
+    report = tmp_path / "result.json"
+    assert invoke_analysis(source, artifacts, report).returncode == 2
+    original = report.read_bytes()
+    result = invoke_analysis(report, artifacts, report)
+    assert result.returncode == 1
+    assert report.read_bytes() == original

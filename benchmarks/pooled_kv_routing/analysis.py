@@ -29,9 +29,11 @@ Unknown fields, JSON duplicate keys, bool-as-int, nonfinite values and missing
 inventory fail. Max 144 cases, 100k requests/case, 128 MiB/JSON file. Frozen
 protocol must be sealed externally before outcomes; this reader cannot prove
 pre-registration, tokenizer semantics, raw-adapter fidelity, safety, causality,
-resource cleanup, baseline tuning or CI execution. AC0/5/6 therefore stay NOT RUN
-pending independent evidence review; no eligible boolean can promote them.
-Absent controls are NOT RUN. CLI exit 0 means overall PASS, 1 FAIL, 2 NOT RUN
+resource cleanup, baseline tuning or the complete planned workload contract.
+All benchmark ACs therefore stay NOT RUN. Report v2 separates packet_checks
+(pedagogical/statistical checks only) from benchmark acceptance; neither short
+fixtures nor a resealed truncated cohort can certify a benchmark component.
+No eligible boolean can promote them. CLI exit 1 means FAIL, 2 NOT RUN
 (argparse also uses 2 for grammar errors). A report is written on input failure.
 """
 
@@ -43,6 +45,7 @@ import hashlib
 import json
 import math
 import sys
+import tempfile
 
 # Third Party
 import numpy as np
@@ -126,7 +129,12 @@ def _pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def _read(path: Path) -> dict[str, Any]:
     _require(path.stat().st_size <= 128 * 1024 * 1024, "JSON file exceeds size bound")
-    value = json.loads(path.read_bytes(), object_pairs_hook=_pairs)
+    try:
+        value = json.loads(path.read_bytes(), object_pairs_hook=_pairs)
+    except (json.JSONDecodeError, UnicodeError, RecursionError) as exc:
+        raise ValueError(
+            f"invalid JSON in {path.name}: {type(exc).__name__}: {exc}"
+        ) from exc
     _require(isinstance(value, dict), "JSON root must be object")
     return value
 
@@ -145,15 +153,59 @@ def _status(values: list[str]) -> str:
 
 def _report(diagnostic: str) -> dict[str, Any]:
     return {
-        "version": 1,
+        "version": 2,
+        "scope": "packet-statistics-only",
         "evidence_status": "FAIL",
         "correctness_status": "NOT RUN",
         "performance_status": "NOT RUN",
         "overall_status": "FAIL",
         "acceptance": {f"AC{i}": "NOT RUN" for i in range(7)},
         "metrics": {},
+        "packet_checks": {},
         "diagnostics": [diagnostic],
     }
+
+
+def _write_report(
+    output: Path, protocol: Path, artifacts: Path, report: dict[str, Any]
+) -> None:
+    # Exclusive creation protects unknown files; only our own reports may be
+    # atomically refreshed, so a failed decode cannot leave a stale success.
+    _require(
+        not output.resolve().is_relative_to(artifacts.resolve()),
+        "output must be outside raw artifacts",
+    )
+    _require(
+        not output.is_symlink() and output.resolve() != protocol.resolve(),
+        "output aliases a protected input",
+    )
+    if output.exists():
+        _require(
+            output.is_file() and output.stat().st_nlink == 1,
+            "output must not be a hardlink or non-file",
+        )
+        previous = _read(output)
+        _require(
+            previous.get("scope") == "packet-statistics-only"
+            and previous.get("version") == 2,
+            "output exists and is not a v2 analysis report",
+        )
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", dir=output.parent, delete=False
+            ) as stream:
+                temporary = Path(stream.name)
+                json.dump(report, stream, sort_keys=True, indent=2, allow_nan=False)
+                stream.write("\n")
+            temporary.replace(output)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+    else:
+        with output.open("x") as stream:
+            json.dump(report, stream, sort_keys=True, indent=2, allow_nan=False)
+            stream.write("\n")
 
 
 def _interval(baseline: list[float], cost: list[float]) -> dict[str, float]:
@@ -435,8 +487,10 @@ def analyze(protocol: Protocol, artifacts: Path) -> dict[str, Any]:
         protocol: Externally frozen v1 contract described in the module docstring.
         artifacts: Directory containing inventory.json and exactly its arm files.
     Returns:
-        JSON report with independent evidence/correctness/performance/overall
-        statuses, AC0..6, diagnostics and metrics (improvement ratios, not percent).
+        Report v2 with packet_checks, metrics (improvement ratios, not percent),
+        diagnostics and evidence status. All benchmark AC0..6 and performance
+        qualification remain NOT RUN until the complete benchmark contract is
+        independently validated outside this packet-statistics reader.
         Bootstrap is 10,000 paired resamples, NumPy default_rng seed 42, linear
         2.5/97.5 percentiles. Blocks, not requests, receive equal weight.
     Raises:
@@ -520,8 +574,8 @@ def analyze(protocol: Protocol, artifacts: Path) -> dict[str, Any]:
         }
         metrics[scenario]["arms"] = group
     primary = metrics["primary"]
-    ac = {f"AC{i}": "NOT RUN" for i in range(7)}
-    ac["AC1"] = (
+    checks = {}
+    checks["ttft_threshold"] = (
         "PASS"
         if all(
             value > 0.05 and not math.isclose(value, 0.05, rel_tol=0, abs_tol=1e-12)
@@ -529,7 +583,7 @@ def analyze(protocol: Protocol, artifacts: Path) -> dict[str, Any]:
         )
         else "FAIL"
     )
-    ac["AC2"] = "PASS"
+    checks["token_equality"] = "PASS"
     controls = []
     for scenario in ("equal-load", "unique", "slow-path"):
         if scenario not in metrics or len(groups[scenario]["Cost"]) < 8:
@@ -542,7 +596,7 @@ def analyze(protocol: Protocol, artifacts: Path) -> dict[str, Any]:
     for scenario in ("low-load", "cost-observe"):
         if scenario not in metrics or len(groups[scenario]["Cost"]) < 4:
             controls.append("NOT RUN")
-    ac["AC3"] = _status(controls)
+    checks["control_regressions"] = _status(controls)
     baseline_good = [r["goodput"] for r in groups["primary"][protocol["baseline"]]]
     cost_good = [r["goodput"] for r in groups["primary"]["Cost"]]
     # A zero baseline goodput is valid, but cannot define a ratio CI.
@@ -552,7 +606,7 @@ def analyze(protocol: Protocol, artifacts: Path) -> dict[str, Any]:
     )
     good_lower = float(np.quantile(good_delta[idx].mean(axis=1), 0.025))
     primary["goodput_delta_lower"] = good_lower
-    ac["AC4"] = (
+    checks["streaming"] = (
         "PASS"
         if primary["itl"]["lower"] >= -0.03
         and primary["throughput"]["upper"] <= 0.02
@@ -560,18 +614,21 @@ def analyze(protocol: Protocol, artifacts: Path) -> dict[str, Any]:
         else "FAIL"
     )
     return {
-        "version": 1,
+        "version": 2,
+        "scope": "packet-statistics-only",
         "protocol_sha256": protocol_sha,
         "bootstrap": {"seed": 42, "resamples": 10_000, "unit": "paired block"},
         "evidence_status": "PASS",
         "correctness_status": "NOT RUN",
-        "performance_status": _status([ac[k] for k in ("AC1", "AC3", "AC4")]),
-        "overall_status": _status(list(ac.values())),
-        "acceptance": ac,
+        "performance_status": "NOT RUN",
+        "overall_status": "NOT RUN",
+        "acceptance": {f"AC{i}": "NOT RUN" for i in range(7)},
+        "packet_checks": checks,
         "metrics": metrics,
         "diagnostics": [
-            "AC0/AC5/AC6 require external safety, mechanism and independent "
-            "checker evidence; token equality alone does not establish resource safety."
+            "Packet statistics are not benchmark qualification. The complete "
+            "planned workload, deployment, safety, mechanism and independent "
+            "checker evidence have not been validated; all ACs remain NOT RUN."
         ],
     }
 
@@ -579,30 +636,27 @@ def analyze(protocol: Protocol, artifacts: Path) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     """Analyze --protocol FILE --artifacts DIR --output FILE; persist even FAIL.
 
-    Returns 0 for overall PASS, 1 FAIL, 2 NOT RUN. Output must live outside the
-    raw inventory directory. Input errors retain a structured diagnostic report.
+    Returns 1 FAIL or 2 NOT RUN. Output must live outside raw artifacts and not
+    alias protocol. New paths are exclusive; existing v2 analysis reports alone
+    may be atomically refreshed. Other existing files/aliases are preserved.
+    Input errors retain a fresh structured diagnostic report at a safe output.
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--protocol", type=Path, required=True)
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
-    if args.output.resolve().is_relative_to(args.artifacts.resolve()):
-        print("analysis: output must be outside raw artifacts", file=sys.stderr)
-        return 1
     try:
         report = analyze(cast(Protocol, _read(args.protocol)), args.artifacts)
     except (OSError, ValueError, TypeError, KeyError) as exc:
         report = _report(str(exc))
     try:
-        args.output.write_text(
-            json.dumps(report, sort_keys=True, indent=2, allow_nan=False) + "\n"
-        )
-    except OSError as exc:
+        _write_report(args.output, args.protocol, args.artifacts, report)
+    except (OSError, ValueError) as exc:
         print(f"analysis: cannot write report: {exc}", file=sys.stderr)
         return 1
     print(f"analysis: {report['overall_status']}", file=sys.stderr)
-    return {"PASS": 0, "FAIL": 1, "NOT RUN": 2}[report["overall_status"]]
+    return 1 if report["overall_status"] == "FAIL" else 2
 
 
 if __name__ == "__main__":
