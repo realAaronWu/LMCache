@@ -157,6 +157,25 @@ def test_overflowing_reserve_is_atomic(
     assert state.snapshot(0)[0].pending_requests == len(existing_work) + 1
 
 
+def test_integer_aggregate_rejection_is_value_error_and_atomic() -> None:
+    state = Telemetry((WorkerSnapshot("a", "http://a", True, 0, 0),), namespace="n")
+    state.reserve(RouteRequest("first", (1,), 1, 0), "a", 10**308, 0)
+    before = state.snapshot(0)
+    retry = RouteRequest("retry", (1,), 1, 0)
+    with pytest.raises(ValueError, match="pending_work_ms"):
+        state.reserve(retry, "a", 10**308, 10)
+    assert state.snapshot(0) == before
+    state.confirmed_complete("first", 0)
+    state.reserve(retry, "a", 10**308, 0)
+    assert state.snapshot(0)[0].pending_requests == 1
+    assert state.snapshot(0)[0].pending_work_ms == before[0].pending_work_ms
+
+
+def test_huge_integer_worker_work_rejected_as_value_error() -> None:
+    with pytest.raises(ValueError, match="pending_work_ms"):
+        WorkerSnapshot("a", "http://a", True, 0, 10**400)
+
+
 def test_overflowing_observation_preserves_epoch_catalog_and_clock() -> None:
     state = Telemetry(
         (WorkerSnapshot("a", "http://a", True, 0, 0, epoch="e1"),), namespace="n"
