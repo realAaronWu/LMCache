@@ -176,6 +176,34 @@ def test_huge_integer_worker_work_rejected_as_value_error() -> None:
         WorkerSnapshot("a", "http://a", True, 0, 10**400)
 
 
+@pytest.mark.parametrize("uncertain", [False, True], ids=["complete", "cancel"])
+@pytest.mark.parametrize("wrong_worker", ["b", ""], ids=["other", "empty"])
+def test_terminal_worker_guard_is_atomic(uncertain: bool, wrong_worker: str) -> None:
+    state = Telemetry(
+        (
+            WorkerSnapshot("a", "http://a", True, 0, 0),
+            WorkerSnapshot("b", "http://b", True, 0, 0),
+        ),
+        namespace="n",
+    )
+    state.reserve(RouteRequest("r", (1,), 1, 0), "a", 7, 0)
+    before = state.snapshot(0)
+    operation = state.cancel_unconfirmed if uncertain else state.confirmed_complete
+    with pytest.raises(ValueError, match="worker_id"):
+        operation("r", 10, worker_id=wrong_worker)
+    assert state.snapshot(0) == before
+    with pytest.raises(KeyError):
+        operation("unknown", 10, worker_id="a")
+    assert state.snapshot(0) == before
+    operation("r", 0, worker_id="a")
+    worker = state.snapshot(0)[0]
+    assert worker.healthy is not uncertain
+    assert worker.pending_work_ms == (7 if uncertain else 0)
+    if uncertain:
+        operation("r", 0, worker_id="a")
+        assert state.snapshot(0)[0] == worker
+
+
 def test_overflowing_observation_preserves_epoch_catalog_and_clock() -> None:
     state = Telemetry(
         (WorkerSnapshot("a", "http://a", True, 0, 0, epoch="e1"),), namespace="n"
