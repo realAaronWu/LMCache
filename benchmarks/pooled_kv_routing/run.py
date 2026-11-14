@@ -27,7 +27,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "preflight":
         return preflight.main(remaining)
     elif args.command == "generate":
-        return workloads.main(remaining)
+        return workloads.main([args.command, *remaining])
     elif args.command == "analyze":
         return analysis.main(remaining)
     elif args.command == "serve":
