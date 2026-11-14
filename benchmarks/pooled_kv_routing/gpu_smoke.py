@@ -5,7 +5,9 @@ Run this standalone script on the CUDA host. Both endpoints are HTTP origins
 (no /v1 suffix); only the direct endpoint needs /v1/models and
 /server_info?config_format=json. Corpus JSON is a list of nonempty token-ID
 lists. The output directory must not exist. Each case sends the same deterministic
-vLLM /v1/completions request directly and via the proxy. Raw bounded SSE bytes,
+vLLM /v1/completions generation payload directly and via the proxy. Only the proxy
+wire request adds request_id: gpu-smoke-<24 hex output-directory hash>-<case index>.
+Raw bounded SSE bytes,
 requests, client-side timing, filtered endpoint receipts and failure diagnostics
 are retained. No proxy parser or sibling benchmark module is imported.
 """
@@ -94,11 +96,17 @@ async def _receipt(client: httpx.AsyncClient, origin: str, path: str) -> object:
 
 
 async def _stream(
-    client: httpx.AsyncClient, origin: str, request: dict[str, object], raw_path: Path
+    client: httpx.AsyncClient,
+    origin: str,
+    request: dict[str, object],
+    raw_path: Path,
+    observation: dict[str, object],
 ) -> dict[str, object]:
     """Observe bounded SSE independently of the proxy; reject incomplete streams."""
-    started = time.perf_counter()
+    started = cast(float, observation["started_monotonic_seconds"])
     tokens: list[int] = []
+    observation["token_ids"] = tokens
+    prompt_seen = False
     text = ""
     finish: str | None = None
     usage: dict[str, object] | None = None
@@ -112,6 +120,7 @@ async def _stream(
         async with client.stream(
             "POST", origin + "/v1/completions", json=request
         ) as response:
+            observation["http_status"] = response.status_code
             # Retain error bodies as well as partial successful streams.
             async for chunk in response.aiter_bytes():
                 raw.write(chunk[: MAX_BYTES - size])
@@ -145,8 +154,17 @@ async def _stream(
                         raise ValueError("data after DONE")
                     if data == "[DONE]":
                         done = True
+                        observation["done"] = True
                         continue
                     event = _object(_json(data))
+                    if "error" in event:
+                        raise ValueError("error-bearing completion envelope")
+                    if (
+                        event.get("object") != "text_completion"
+                        or type(event.get("created")) is not int
+                        or cast(int, event["created"]) < 0
+                    ):
+                        raise ValueError("invalid completion envelope metadata")
                     if event.get("model") != request["model"]:
                         raise ValueError("response model mismatch")
                     identity = event.get("id")
@@ -162,6 +180,8 @@ async def _stream(
                         if finish is not None or usage is not None:
                             raise ValueError("choice after finish/usage")
                         choice = _object(choices[0])
+                        if "error" in choice:
+                            raise ValueError("error-bearing completion choice")
                         if type(choice.get("index")) is not int or choice["index"] != 0:
                             raise ValueError("invalid choice index")
                         delta = _ids(
@@ -169,6 +189,7 @@ async def _stream(
                         )
                         if delta and first_token is None:
                             first_token = time.perf_counter() - started
+                            observation["ttft_seconds"] = first_token
                         tokens.extend(delta)
                         if len(tokens) > cast(int, request["max_tokens"]):
                             raise ValueError("too many completion tokens")
@@ -181,22 +202,34 @@ async def _stream(
                             if reason not in {"stop", "length"}:
                                 raise ValueError("invalid finish_reason")
                             finish = cast(str, reason)
+                            observation["finish_reason"] = finish
                         prompt_ids = choice.get("prompt_token_ids")
+                        if not prompt_seen and prompt_ids is None:
+                            raise ValueError(
+                                "first choice must include prompt_token_ids"
+                            )
                         if (
                             prompt_ids is not None
                             and _ids(prompt_ids, MAX_TOKENS) != request["prompt"]
                         ):
                             raise ValueError("prompt token IDs mismatch")
+                        if prompt_ids is not None:
+                            prompt_seen = True
+                            observation["prompt_token_ids"] = prompt_ids
                     if event.get("usage") is not None:
                         if usage is not None or finish is None:
                             raise ValueError("duplicate or premature usage")
                         usage = _object(event["usage"])
+                        if "error" in usage:
+                            raise ValueError("error-bearing completion usage")
+                        observation["usage"] = usage
             response.raise_for_status()
     if (
         pending
         or event_lines
         or not done
         or not tokens
+        or not prompt_seen
         or finish is None
         or usage is None
     ):
@@ -298,14 +331,52 @@ async def _serve(
                 "add_special_tokens": False,
             }
             case: dict[str, object] = {"request": request, "status": "FAIL"}
+            wire_requests: dict[str, object] = {}
+            case["wire_requests"] = wire_requests
             cases.append(case)
             for name, origin in (
                 ("direct", args.direct_endpoint),
                 ("proxy", args.proxy_endpoint),
             ):
-                case[name] = await _stream(
-                    client, origin, request, args.output_dir / f"{index}-{name}.sse"
-                )
+                outgoing = dict(request)
+                if name == "proxy":
+                    outgoing["request_id"] = f"gpu-smoke-{report['run_id']}-{index}"
+                wire_requests[name] = outgoing
+                observation: dict[str, object] = {
+                    "status": "FAIL",
+                    "started_unix_ns": time.time_ns(),
+                    "started_monotonic_seconds": time.perf_counter(),
+                    "ttft_seconds": None,
+                    "http_status": None,
+                    "done": False,
+                    "raw_file": f"{index}-{name}.sse",
+                }
+                case[name] = observation
+                try:
+                    result = await _stream(
+                        client,
+                        origin,
+                        outgoing,
+                        args.output_dir / f"{index}-{name}.sse",
+                        observation,
+                    )
+                    observation.update(result)
+                    observation["status"] = "PASS"
+                except (
+                    ValueError,
+                    TypeError,
+                    KeyError,
+                    OSError,
+                    RuntimeError,
+                    httpx.HTTPError,
+                    asyncio.CancelledError,
+                ) as exc:
+                    observation["error"] = f"{type(exc).__name__}: {exc}"
+                    raise
+                finally:
+                    observation["elapsed_seconds"] = time.perf_counter() - cast(
+                        float, observation["started_monotonic_seconds"]
+                    )
             direct, proxy = _object(case["direct"]), _object(case["proxy"])
             for key in ("token_ids", "text", "finish_reason", "usage"):
                 if direct[key] != proxy[key]:
@@ -350,6 +421,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"output directory must be new and writable: {exc}")
     report: dict[str, object] = {
         "schema_version": 1,
+        "run_id": hashlib.sha256(str(args.output_dir.resolve()).encode()).hexdigest()[
+            :24
+        ],
         "status": "FAIL",
         "scope": "single_gpu_serving_only",
         "native_lmcache_p2p": "NOT RUN",
