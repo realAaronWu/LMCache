@@ -136,3 +136,67 @@ def test_restart_with_active_work_does_not_forgive_reservation() -> None:
     snapshot = state.snapshot(1)[0]
     assert not snapshot.healthy
     assert snapshot.pending_work_ms == 4
+
+
+@pytest.mark.parametrize(("observed_ms", "existing_work"), [(0, (1e308,)), (1e308, ())])
+def test_overflowing_reserve_is_atomic(
+    observed_ms: float, existing_work: tuple[float, ...]
+) -> None:
+    state = Telemetry(
+        (WorkerSnapshot("a", "http://a", True, 0, observed_ms),), namespace="n"
+    )
+    for i, work_ms in enumerate(existing_work):
+        state.reserve(RouteRequest(str(i), (1,), 1, 0), "a", work_ms, 0)
+    before = state.snapshot(0)
+    rejected = RouteRequest("rejected", (1,), 1, 0)
+    with pytest.raises(ValueError, match="pending_work_ms"):
+        state.reserve(rejected, "a", 1e308, 10)
+    # Rejection must not consume an ID, add work, taint, or advance the clock.
+    assert state.snapshot(0) == before
+    state.reserve(rejected, "a", 1, 0)
+    assert state.snapshot(0)[0].pending_requests == len(existing_work) + 1
+
+
+def test_overflowing_observation_preserves_epoch_catalog_and_clock() -> None:
+    state = Telemetry(
+        (WorkerSnapshot("a", "http://a", True, 0, 0, epoch="e1"),), namespace="n"
+    )
+    request = RouteRequest("r", (1,), 1, 0)
+    state.confirm_prefix("a", (1,), namespace="n", epoch="e1", sampled_ns=0)
+    state.reserve(request, "a", 1e308, 0)
+    before = state.snapshot(0, request)
+    with pytest.raises(ValueError, match="pending_work_ms"):
+        state.observe_worker(
+            WorkerSnapshot("a", "http://a", True, 10, 1e308), epoch="e2"
+        )
+    assert state.snapshot(0, request) == before
+    state.confirmed_complete("r", 0)
+    state.observe_worker(WorkerSnapshot("a", "http://a", True, 10, 1e308), epoch="e1")
+    assert state.snapshot(10)[0].pending_work_ms == 1e308
+
+
+def test_confirmed_fetch_path_is_request_specific_and_expires() -> None:
+    state = Telemetry(
+        (WorkerSnapshot("a", "http://a", True, 0, 0, epoch="e"),), namespace="n"
+    )
+    request = RouteRequest("r", (1, 2, 3), 1, 0)
+    state.confirm_prefix(
+        "a", (1,), namespace="n", epoch="e", sampled_ns=0, fetch_path="remote_host"
+    )
+    state.confirm_prefix(
+        "a", (1, 2), namespace="n", epoch="e", sampled_ns=0, fetch_path="local_host"
+    )
+    assert state.snapshot(0, request)[0].fetch_path == "local_host"
+    assert state.snapshot(0)[0].fetch_path is None
+    state.observe_worker(WorkerSnapshot("a", "http://a", True, 1, 0), epoch="new")
+    assert state.snapshot(1, request)[0].fetch_path is None
+    state.confirm_prefix(
+        "a",
+        (1,),
+        namespace="n",
+        epoch="new",
+        sampled_ns=1,
+        fetch_path="remote_host",
+    )
+    assert state.snapshot(300_000_001, request)[0].fetch_path == "remote_host"
+    assert state.snapshot(300_000_002, request)[0].fetch_path is None

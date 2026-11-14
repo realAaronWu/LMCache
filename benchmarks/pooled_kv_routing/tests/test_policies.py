@@ -149,3 +149,21 @@ def test_freshness_boundary_and_health_apply_to_every_policy(policy: Policy) -> 
         RouterConfig(300_000_000, policy=policy),
     )
     assert boundary.load_mode == "native_load"
+
+
+@pytest.mark.parametrize("policy", ["static", "cost"])
+@pytest.mark.parametrize("mode", ["native_load", "skip_external"])
+def test_static_credit_overflow_rejected(policy: Policy, mode: LoadMode) -> None:
+    workers = (
+        WorkerSnapshot("a", "http://a", True, 0, 100, 2, 2),
+        WorkerSnapshot("b", "http://b", True, 0, 0, 2, 2),
+    )
+    config = RouterConfig(
+        0,
+        policy=policy,
+        baseline="static",
+        alpha_ms_per_token=1e308,
+        baseline_load_mode=mode,
+    )
+    with pytest.raises(ValueError, match="static"):
+        choose(RouteRequest("0", (1, 2), 1, 0), workers, CostTable("v", ()), config)
