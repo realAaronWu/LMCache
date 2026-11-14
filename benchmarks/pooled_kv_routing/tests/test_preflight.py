@@ -19,17 +19,103 @@ from benchmarks.pooled_kv_routing.preflight import main, preflight
 BASE = "bcafb031401d404a5dabae4853f5e23bf9e5685c"
 
 
+@pytest.mark.parametrize(
+    "capture",
+    [
+        '{"actual_token_ids":[',
+        '{"returncode":23,"stdout":"PASS","complete":true}',
+        '{"tokens":[1,2],"request_id":"other-request"}',
+    ],
+)
+def test_cli_retained_capture_cannot_be_overridden(
+    config: dict, tmp_path: Path, capture: str
+) -> None:
+    native = json.loads(Path(config["native_evidence"]["path"]).read_text())
+    path = tmp_path / "retained"
+    path.write_text(capture)
+    native["cases"][0]["probe"] = {
+        "path": str(path),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+    config["native_evidence"] = artifact(tmp_path, "index", native)
+    cfg, out = tmp_path / "config", tmp_path / "report"
+    cfg.write_text(json.dumps(config))
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "benchmarks.pooled_kv_routing.preflight",
+            "--config",
+            str(cfg),
+            "--output",
+            str(out),
+        ],
+        capture_output=True,
+        timeout=10,
+    )
+    assert child.returncode == 1
+    assert json.loads(out.read_text())["functional_status"] != "PASS"
+
+
 def artifact(tmp_path: Path, name: str, value: object) -> dict:
-    data = json.dumps(value, allow_nan=False).encode()
+    data = json.dumps(value).encode()
     path = tmp_path / name
     path.write_bytes(data)
     return {"path": str(path), "sha256": hashlib.sha256(data).hexdigest()}
 
 
+def capture(
+    tmp_path: Path, name: str, role: str, identity: dict, observation: dict
+) -> dict:
+    return artifact(
+        tmp_path,
+        name,
+        {
+            "schema_version": 2,
+            "role": role,
+            "identity": identity,
+            "terminal": "completed",
+            "returncode": 0,
+            "observation": observation,
+            "logs": [artifact(tmp_path, name + "-stdout", "PASS")],
+        },
+    )
+
+
+def load(ref: dict) -> dict:
+    return json.loads(Path(ref["path"]).read_text())
+
+
+def node_artifact(tmp_path: Path, name: str, cfg: dict, node: dict) -> dict:
+    return capture(
+        tmp_path,
+        name,
+        "inventory",
+        {"run_id": cfg["run_id"], "source_head": cfg["source"]["head"]},
+        node,
+    )
+
+
+def freeze_environment(tmp_path: Path, cfg: dict) -> None:
+    env = cfg["environment"]
+    env["artifact"] = capture(
+        tmp_path,
+        "environment",
+        "environment",
+        {"run_id": cfg["run_id"], "source_head": cfg["source"]["head"]},
+        {
+            **{k: v for k, v in env.items() if k != "artifact"},
+            "binaries": [artifact(tmp_path, "installed-binary", "fixture-binary")],
+            "argv": ["python", "native-probe.py"],
+        },
+    )
+
+
 @pytest.fixture
 def config(tmp_path: Path) -> dict:
     cfg = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "run_id": "fixture-run-1",
         "scope": "functional_single_gpu",
         "source": {
             "base": BASE,
@@ -51,11 +137,11 @@ def config(tmp_path: Path) -> dict:
             "driver": "595.84",
             "nixl": "0.7.0",
             "image_digest": "sha256:" + "c" * 64,
-            "artifact": artifact(tmp_path, "environment-lock", {"wheel": "e" * 64}),
         },
         "nodes": [],
         "native_evidence": None,
     }
+    freeze_environment(tmp_path, cfg)
     node = {
         "host_id": "machine-A",
         "gpu_uuid": "GPU-A",
@@ -67,15 +153,16 @@ def config(tmp_path: Path) -> dict:
         "source": cfg["source"],
         "model": cfg["model"],
         "environment": cfg["environment"],
-        "raw": [artifact(tmp_path, "inventory-raw", {"collector": "fixture"})],
     }
-    cfg["nodes"] = [artifact(tmp_path, "node-A", node)]
+    cfg["nodes"] = [node_artifact(tmp_path, "node-A", cfg, node)]
     bind_native(tmp_path, cfg)
     return cfg
 
 
 def bind_native(tmp_path: Path, cfg: dict, cases: list | None = None) -> None:
-    provenance = {k: cfg[k] for k in ("source", "model", "environment", "nodes")}
+    provenance = {
+        k: cfg[k] for k in ("run_id", "source", "model", "environment", "nodes")
+    }
     probe = {
         "provenance_sha256": hashlib.sha256(
             json.dumps(provenance, sort_keys=True, separators=(",", ":")).encode()
@@ -85,7 +172,6 @@ def bind_native(tmp_path: Path, cfg: dict, cases: list | None = None) -> None:
         else [
             {
                 "name": "single_gpu",
-                "returncode": 0,
                 "request_id": "req-1",
                 "host_ids": ["machine-A"],
                 "transport": "local",
@@ -94,10 +180,46 @@ def bind_native(tmp_path: Path, cfg: dict, cases: list | None = None) -> None:
                 "expected_token_ids": [1, 2],
                 "actual_token_ids": [1, 2],
                 "loader_extra_args": {},
-                "raw": [artifact(tmp_path, "probe-raw", {"tokens": [1, 2]})],
             }
         ],
     }
+    records = []
+    for item in probe["cases"]:
+        case = {k: item[k] for k in ("name", "request_id", "host_ids")}
+        identity = dict(
+            case, run_id=cfg["run_id"], provenance_sha256=probe["provenance_sha256"]
+        )
+        case["reference"] = capture(
+            tmp_path,
+            item["name"] + "-reference",
+            "reference",
+            identity,
+            {
+                "token_ids": item["expected_token_ids"],
+                "token_count": len(item["expected_token_ids"]),
+            },
+        )
+        case["probe"] = capture(
+            tmp_path,
+            item["name"] + "-probe",
+            "probe",
+            identity,
+            {
+                "token_ids": item["actual_token_ids"],
+                "token_count": len(item["actual_token_ids"]),
+                **{
+                    k: item[k]
+                    for k in (
+                        "transport",
+                        "remote_bytes",
+                        "external_fetches",
+                        "loader_extra_args",
+                    )
+                },
+            },
+        )
+        records.append(case)
+    probe["cases"] = records
     cfg["native_evidence"] = artifact(tmp_path, "native", probe)
 
 
@@ -173,7 +295,17 @@ def test_native_bad_evidence(
     config: dict, tmp_path: Path, field: str, value: object
 ) -> None:
     probe = json.loads(Path(config["native_evidence"]["path"]).read_text())
-    probe["cases"][0][field] = value
+    case = probe["cases"][0]
+    record = load(case["probe"])
+    if field == "host_ids":
+        case[field] = value
+    elif field in ("returncode", "raw"):
+        record["logs" if field == "raw" else field] = value
+    else:
+        record["observation"]["token_ids" if field == "actual_token_ids" else field] = (
+            value
+        )
+    case["probe"] = artifact(tmp_path, "bad-probe", record)
     data = json.dumps(probe).encode()
     path = tmp_path / "native-bad"
     path.write_bytes(data)
@@ -199,10 +331,14 @@ def test_primary_missing_second_node_fails(config: dict) -> None:
 def primary_config(tmp_path: Path, cfg: dict) -> dict:
     cfg = deepcopy(cfg)
     cfg["scope"] = "primary_two_node_rdma"
-    node = json.loads(Path(cfg["nodes"][0]["path"]).read_text())
+    node = load(cfg["nodes"][0])["observation"]
     node.update(host_id="machine-B", gpu_uuid="GPU-B", rdma_gid="gid-B")
-    cfg["nodes"].append(artifact(tmp_path, "node-B", node))
-    case = json.loads(Path(cfg["native_evidence"]["path"]).read_text())["cases"][0]
+    cfg["nodes"].append(node_artifact(tmp_path, "node-B", cfg, node))
+    case = {
+        "expected_token_ids": [1, 2],
+        "actual_token_ids": [1, 2],
+        "loader_extra_args": {},
+    }
     cases = []
     for name in (
         "A_to_B",
@@ -246,9 +382,9 @@ def test_known_unsafe_base_cannot_be_certified(config: dict, tmp_path: Path) -> 
 
 
 def test_functional_does_not_require_rdma(config: dict, tmp_path: Path) -> None:
-    node = json.loads(Path(config["nodes"][0]["path"]).read_text())
+    node = load(config["nodes"][0])["observation"]
     node.update(rdma_device=None, rdma_gid=None, link_gbps=None)
-    config["nodes"][0] = artifact(tmp_path, "non-rdma-node", node)
+    config["nodes"][0] = node_artifact(tmp_path, "non-rdma-node", config, node)
     bind_native(tmp_path, config)
     report = preflight(config)
     assert report["functional_status"] == "PASS"
@@ -259,12 +395,10 @@ def test_bare_metal_environment_uses_binary_manifest(
     config: dict, tmp_path: Path
 ) -> None:
     config["environment"]["image_digest"] = None
-    config["environment"]["artifact"] = artifact(
-        tmp_path, "binary-manifest", {"wheel_sha256": "e" * 64}
-    )
-    node = json.loads(Path(config["nodes"][0]["path"]).read_text())
+    freeze_environment(tmp_path, config)
+    node = load(config["nodes"][0])["observation"]
     node["environment"] = config["environment"]
-    config["nodes"][0] = artifact(tmp_path, "bare-metal", node)
+    config["nodes"][0] = node_artifact(tmp_path, "bare-metal", config, node)
     bind_native(tmp_path, config)
     assert preflight(config)["evidence_status"] == "PASS"
     Path(config["environment"]["artifact"]["path"]).unlink()
@@ -288,9 +422,13 @@ def test_primary_inventory_rejected(
     config: dict, tmp_path: Path, field: str, value: object
 ) -> None:
     cfg = primary_config(tmp_path, config)
-    node = json.loads(Path(cfg["nodes"][1]["path"]).read_text())
-    node[field] = value
-    data = json.dumps(node).encode()
+    record = load(cfg["nodes"][1])
+    node = record["observation"]
+    if field == "raw":
+        record["logs"] = value
+    else:
+        node[field] = value
+    data = json.dumps(record).encode()
     path = tmp_path / "bad-node"
     path.write_bytes(data)
     cfg["nodes"][1] = {"path": str(path), "sha256": hashlib.sha256(data).hexdigest()}
@@ -306,22 +444,32 @@ def test_rdma_and_skip_require_observations(
 ) -> None:
     cfg = primary_config(tmp_path, config)
     probe = json.loads(Path(cfg["native_evidence"]["path"]).read_text())
+    case = probe["cases"][-1 if mutation == "skip_ignored" else 0]
+    record = load(case["probe"])
     if mutation == "tcp":
-        probe["cases"][0]["transport"] = "tcp"
+        record["observation"]["transport"] = "tcp"
     elif mutation == "no_bytes":
-        probe["cases"][0]["remote_bytes"] = 0
+        record["observation"]["remote_bytes"] = 0
     elif mutation == "skip_ignored":
-        probe["cases"][-1]["loader_extra_args"] = {}
+        record["observation"]["loader_extra_args"] = {}
     else:
         probe["cases"].pop()
+    case["probe"] = artifact(tmp_path, "mutated-capture", record)
     cfg["native_evidence"] = artifact(tmp_path, "bad-native", probe)
     assert preflight(cfg)["checks"]["native"]["status"] == "FAIL"
 
 
 def test_unknown_new_head_remains_unqualified(config: dict, tmp_path: Path) -> None:
-    cfg = primary_config(tmp_path, config)
-    cfg["source"]["head"] = "d" * 40
-    assert preflight(cfg)["eligible_for_primary"] is False
+    config["source"]["head"] = "d" * 40
+    freeze_environment(tmp_path, config)
+    node = load(config["nodes"][0])["observation"]
+    node.update(source=config["source"], environment=config["environment"])
+    config["nodes"][0] = node_artifact(tmp_path, "new-head-node", config, node)
+    bind_native(tmp_path, config)
+    report = preflight(primary_config(tmp_path, config))
+    assert report["evidence_status"] == "PASS"
+    assert report["checks"]["resource_safety"]["status"] == "NOT RUN"
+    assert report["eligible_for_primary"] is False
 
 
 def test_cli_actual_exit_and_report(config: dict, tmp_path: Path) -> None:
@@ -384,7 +532,127 @@ def test_source_payload_required(config: dict) -> None:
 def test_functional_inventory_strict_types(
     config: dict, tmp_path: Path, field: str, value: object
 ) -> None:
-    node = json.loads(Path(config["nodes"][0]["path"]).read_text())
+    node = load(config["nodes"][0])["observation"]
     node[field] = value
-    config["nodes"][0] = artifact(tmp_path, "bad-functional-node", node)
+    config["nodes"][0] = node_artifact(tmp_path, "bad-functional-node", config, node)
     assert preflight(config)["checks"]["inventory"]["status"] == "FAIL"
+
+
+@pytest.mark.parametrize("role", ["environment", "inventory", "reference", "probe"])
+@pytest.mark.parametrize("fault", ["exit23", "partial", "stale", "missing"])
+def test_cli_authoritative_capture_failures(
+    config: dict, tmp_path: Path, role: str, fault: str
+) -> None:
+    native = load(config["native_evidence"])
+    case = native["cases"][0]
+    ref = (
+        config["environment"]["artifact"]
+        if role == "environment"
+        else config["nodes"][0]
+        if role == "inventory"
+        else case[role]
+    )
+    record = load(ref)
+    if fault == "exit23":
+        record["returncode"] = 23  # Diagnostic stdout still contains PASS.
+    elif fault == "partial":
+        record["terminal"] = "collecting"
+    elif fault == "stale":
+        record["identity"]["run_id"] = "previous-run"
+    else:
+        del record["observation"]
+    changed = artifact(tmp_path, "bad-" + role, record)
+    if role == "environment":
+        config["environment"]["artifact"] = changed
+    elif role == "inventory":
+        config["nodes"][0] = changed
+    else:
+        case[role] = changed
+        config["native_evidence"] = artifact(tmp_path, "bad-index", native)
+    cfg, out = tmp_path / "cli-config", tmp_path / "cli-report"
+    cfg.write_text(json.dumps(config))
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "benchmarks.pooled_kv_routing.preflight",
+            "--config",
+            str(cfg),
+            "--output",
+            str(out),
+        ],
+        capture_output=True,
+        timeout=10,
+    )
+    report = json.loads(out.read_text())
+    assert child.returncode == 1
+    assert report["evidence_status"] == "FAIL"
+    stage = (
+        "configuration"
+        if role == "environment"
+        else "inventory"
+        if role == "inventory"
+        else "native"
+    )
+    assert report["checks"][stage]["status"] == "FAIL"
+    assert report["functional_status"] != "PASS"
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "truncated_tokens",
+        "case_identity",
+        "missing_reference",
+        "unexpected_summary",
+        "counter_drift",
+    ],
+)
+def test_cli_capture_inventory_consistency(
+    config: dict, tmp_path: Path, fault: str
+) -> None:
+    native = load(config["native_evidence"])
+    case = native["cases"][0]
+    record = load(case["probe"])
+    if fault == "truncated_tokens":
+        record["observation"]["token_ids"] = [1]
+    elif fault == "case_identity":
+        case["request_id"] = "wrong-request"
+    elif fault == "missing_reference":
+        del case["reference"]
+    elif fault == "unexpected_summary":
+        case["returncode"] = 0
+    else:
+        record["observation"]["external_fetches"] = 1
+    case["probe"] = artifact(tmp_path, "changed-probe", record)
+    config["native_evidence"] = artifact(tmp_path, "changed-index", native)
+    cfg, out = tmp_path / "cli-config", tmp_path / "cli-report"
+    cfg.write_text(json.dumps(config))
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "benchmarks.pooled_kv_routing.preflight",
+            "--config",
+            str(cfg),
+            "--output",
+            str(out),
+        ],
+        capture_output=True,
+        timeout=10,
+    )
+    assert child.returncode == 1
+    assert json.loads(out.read_text())["checks"]["native"]["status"] == "FAIL"
+
+
+@pytest.mark.parametrize(
+    "field,value", [("binaries", []), ("argv", []), ("torch", "2.8.0")]
+)
+def test_environment_capture_semantics(
+    config: dict, tmp_path: Path, field: str, value: object
+) -> None:
+    record = load(config["environment"]["artifact"])
+    record["observation"][field] = value
+    config["environment"]["artifact"] = artifact(tmp_path, "bad-env", record)
+    report = preflight(config)
+    assert report["checks"]["configuration"]["status"] == "FAIL"
