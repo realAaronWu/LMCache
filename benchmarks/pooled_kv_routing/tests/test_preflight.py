@@ -489,11 +489,52 @@ def test_cli_actual_exit_and_report(config: dict, tmp_path: Path) -> None:
     result = subprocess.run(command, capture_output=True, timeout=10)
     assert result.returncode == 0, result.stderr
     assert json.loads(output.read_text())["eligible_for_primary"] is False
+    previous = output.read_bytes()
     config["scope"] = "primary_two_node_rdma"
     path.write_text(json.dumps(config))
+    command[-1] = str(tmp_path / "failed-rerun.json")
     result = subprocess.run(command, capture_output=True, timeout=10)
     assert result.returncode != 0
-    assert json.loads(output.read_text())["evidence_status"] == "FAIL"
+    assert json.loads(Path(command[-1]).read_text())["evidence_status"] == "FAIL"
+    assert output.read_bytes() == previous
+
+
+@pytest.mark.parametrize("target", ["config", "raw", "hardlink", "existing-report"])
+def test_cli_never_overwrites_existing_files(
+    config: dict, tmp_path: Path, target: str
+) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+    raw = Path(load(config["native_evidence"])["cases"][0]["probe"]["path"])
+    if target == "config":
+        output = path
+    elif target == "raw":
+        output = raw
+    elif target == "hardlink":
+        output = tmp_path / "hardlink.json"
+        os.link(raw, output)
+    else:
+        output = tmp_path / "existing-report.json"
+        assert main(["--config", str(path), "--output", str(output)]) == 0
+    previous = output.read_bytes()
+    original_raw = raw.read_bytes()
+    original_config = path.read_bytes()
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "benchmarks.pooled_kv_routing.preflight",
+            "--config",
+            str(path),
+            "--output",
+            str(output),
+        ],
+        capture_output=True,
+        timeout=10,
+    )
+    assert (child.returncode != 0, output.read_bytes() == previous) == (True, True)
+    assert raw.read_bytes() == original_raw
+    assert path.read_bytes() == original_config
 
 
 @pytest.mark.parametrize(

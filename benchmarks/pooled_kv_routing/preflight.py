@@ -455,10 +455,12 @@ def preflight(config: dict[str, object]) -> PreflightReport:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Write a report and return nonzero when the requested scope is unqualified.
+    """Create a fresh report; return nonzero when the scope is unqualified.
 
     Args:
         argv: CLI arguments, or None for sys.argv; accepts --config and --output.
+            Output must not exist. Reruns require a new output path, including
+            failed reruns; existing reports and evidence are never overwritten.
     Returns:
         0 for qualified functional evidence; 1 for failed/unrun qualification.
         Argument parsing and output I/O failures retain conventional CLI errors.
@@ -474,7 +476,8 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, OSError, RecursionError) as exc:
         report = preflight({})
         report["diagnostics"] = [f"config read: {exc}"]
-    Path(args.output).write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+    with Path(args.output).open("x") as stream:
+        stream.write(json.dumps(report, indent=2, allow_nan=False) + "\n")
     return (
         0 if report["evidence_status"] == "PASS" and config["scope"] != PRIMARY else 1
     )
