@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
 from types import ModuleType
+import hashlib
 import importlib.util
 import json
 import time
@@ -34,7 +35,21 @@ def smoke() -> ModuleType:
 
 def stream(mode: str) -> bytes:
     """Build protocol examples, including distinct invalid acceptance paths."""
-    choice = {"index": 0, "text": "ok", "token_ids": [7, 8], "finish_reason": "length"}
+    choice = {
+        "index": 0,
+        "text": "ok",
+        "token_ids": [7, 8],
+        "prompt_token_ids": [1, 2, 3],
+        "finish_reason": "length",
+    }
+    if mode in {"omitted_prompt", "top_level_prompt", "late_prompt"}:
+        del choice["prompt_token_ids"]
+    if mode == "null_prompt":
+        choice["prompt_token_ids"] = None
+    if mode == "wrong_prompt":
+        choice["prompt_token_ids"] = [1, 2, 4]
+    if mode == "bool_prompt":
+        choice["prompt_token_ids"] = [True, 2, 3]
     if mode == "mismatch":
         choice["token_ids"] = [7, 9]
     if mode == "missing_tokens":
@@ -43,13 +58,90 @@ def stream(mode: str) -> bytes:
         choice["token_ids"] = [True, 8]
     if mode == "bad_finish":
         choice["finish_reason"] = "error"
-    event = {"id": "req", "model": "tiny", "choices": [choice]}
-    usage = {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+    event = {
+        "id": "req",
+        "model": "tiny",
+        "object": "text_completion",
+        "created": 123,
+        "choices": [choice],
+    }
+    usage: dict[str, object] = {
+        "prompt_tokens": 3,
+        "completion_tokens": 2,
+        "total_tokens": 5,
+    }
     if mode == "bad_usage":
         usage["completion_tokens"] = 3
     if mode == "bool_usage":
         usage["completion_tokens"] = True
-    events = [event, {"id": "req", "model": "tiny", "choices": [], "usage": usage}]
+    tail = {
+        "id": "req",
+        "model": "tiny",
+        "object": "text_completion",
+        "created": 123,
+        "choices": [],
+        "usage": usage,
+    }
+    events = [event, tail]
+    if mode in {"split", "later_wrong_prompt"}:
+        choice["token_ids"] = [7]
+        choice["text"] = "o"
+        choice["finish_reason"] = None
+        events.insert(
+            1,
+            {
+                **event,
+                "choices": [
+                    {
+                        **choice,
+                        "token_ids": [8],
+                        "text": "k",
+                        "finish_reason": "length",
+                        "prompt_token_ids": [1, 2, 4]
+                        if mode == "later_wrong_prompt"
+                        else None,
+                    }
+                ],
+            },
+        )
+    if mode == "top_level_prompt":
+        event["prompt_token_ids"] = [1, 2, 3]
+    if mode == "late_prompt":
+        choice["finish_reason"] = None
+        events.insert(
+            1,
+            {
+                **event,
+                "choices": [
+                    {
+                        **choice,
+                        "prompt_token_ids": [1, 2, 3],
+                        "token_ids": [],
+                        "finish_reason": "length",
+                    }
+                ],
+            },
+        )
+    if mode == "attached_error":
+        event["error"] = {"message": "failure"}
+    if mode == "null_error":
+        event["error"] = None
+    if mode == "choice_error":
+        choice["error"] = "failure"
+    if mode == "usage_error":
+        usage["error"] = "failure"
+    if mode == "late_error":
+        events.append({**tail, "usage": None, "error": {"message": "late failure"}})
+    if mode == "bad_object":
+        event["object"] = []
+    if mode == "bad_created":
+        event["created"] = "yesterday"
+    if mode == "bool_created":
+        event["created"] = True
+    if mode == "missing_object":
+        del event["object"]
+    if mode == "missing_created":
+        del event["created"]
     if mode == "no_usage":
         events.pop()
     if mode == "wrong_model":
@@ -71,8 +163,10 @@ def stream(mode: str) -> bytes:
 
 
 @contextmanager
-def endpoint(mode: str = "ok") -> Iterator[tuple[str, list[dict[str, object]]]]:
-    """Serve real HTTP, recording requests and closing server and worker threads."""
+def endpoint(
+    mode: str = "ok", *, role: str = "direct"
+) -> Iterator[tuple[str, list[dict[str, object]]]]:
+    """Serve HTTP; proxy requires an ID and direct rejects proxy-only metadata."""
     requests: list[dict[str, object]] = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -112,6 +206,20 @@ def endpoint(mode: str = "ok") -> Iterator[tuple[str, list[dict[str, object]]]]:
             requests.append(
                 json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             )
+            rid = requests[-1].get("request_id")
+            valid_id = (
+                isinstance(rid, str)
+                and 1 <= len(rid) <= 128
+                and rid.isascii()
+                and all(33 <= ord(c) <= 126 for c in rid)
+            )
+            if (role == "proxy" and not valid_id) or (
+                role == "direct" and "request_id" in requests[-1]
+            ):
+                self.send_response(422)
+                self.end_headers()
+                self.wfile.write(b'{"error":"request_id contract violation"}')
+                return
             self.send_response(500 if mode == "http_error" else 200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
@@ -121,6 +229,9 @@ def endpoint(mode: str = "ok") -> Iterator[tuple[str, list[dict[str, object]]]]:
                     self.wfile.flush()
                     time.sleep(0.3)
                 self.wfile.write(stream(mode))
+                if mode == "hang_after_done":
+                    self.wfile.flush()
+                    time.sleep(0.3)
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
@@ -170,23 +281,58 @@ def invoke(
     return code, json.loads((out / "evidence.json").read_text())
 
 
+@pytest.mark.parametrize("mode", ["ok", "split"])
 def test_complete_direct_proxy(
-    smoke: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    smoke: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
 ) -> None:
-    with endpoint() as (direct, requests), endpoint() as (proxy, proxy_requests):
-        code, report = invoke(smoke, monkeypatch, tmp_path, direct, proxy)
+    corpus = tmp_path / "repeated-prompts.json"
+    corpus.write_text("[[1, 2, 3], [1, 2, 3]]")
+    with (
+        endpoint(mode) as (direct, requests),
+        endpoint(mode, role="proxy") as (proxy, proxy_requests),
+    ):
+        code, report = invoke(
+            smoke,
+            monkeypatch,
+            tmp_path,
+            direct,
+            proxy,
+            "--corpus-token-ids",
+            str(corpus),
+        )
     assert code == 0
     assert report["status"] == "PASS"
     assert report["scope"] == "single_gpu_serving_only"
     assert report["native_lmcache_p2p"] == "NOT RUN"
     assert report["performance_gt_5_percent"] == "NOT RUN"
-    assert requests == proxy_requests
+    expected_run_id = hashlib.sha256(
+        str((tmp_path / "evidence").resolve()).encode()
+    ).hexdigest()[:24]
+    assert report["run_id"] == expected_run_id
+    assert "request_id" not in requests[0]
+    assert proxy_requests[0] == {
+        **requests[0],
+        "request_id": f"gpu-smoke-{expected_run_id}-0",
+    }
+    assert len(requests) == len(proxy_requests) == 2
+    assert "request_id" not in requests[1]
+    assert proxy_requests[1] == {
+        **requests[1],
+        "request_id": f"gpu-smoke-{expected_run_id}-1",
+    }
     assert requests[0]["prompt"] == [1, 2, 3]
     assert requests[0]["temperature"] == 0
     assert requests[0]["return_token_ids"] is True
-    result = json.loads((tmp_path / "evidence" / "evidence.json").read_text())["cases"][
-        0
-    ]["direct"]
+    evidence = json.loads((tmp_path / "evidence" / "evidence.json").read_text())
+    case = evidence["cases"][0]
+    result = case["direct"]
+    assert case["request"] == requests[0]
+    assert case["wire_requests"] == {"direct": requests[0], "proxy": proxy_requests[0]}
+    second_case = evidence["cases"][1]
+    assert second_case["wire_requests"] == {
+        "direct": requests[1],
+        "proxy": proxy_requests[1],
+    }
     assert result["token_ids"] == [7, 8]
     assert 0 <= result["ttft_seconds"] <= result["elapsed_seconds"]
     assert (tmp_path / "evidence" / "0-proxy.sse").read_bytes().endswith(b"\r\n\r\n")
@@ -211,17 +357,55 @@ def test_complete_direct_proxy(
         "mismatch",
         "timeout",
         "nonfinite",
+        "omitted_prompt",
+        "null_prompt",
+        "wrong_prompt",
+        "bool_prompt",
+        "top_level_prompt",
+        "late_prompt",
+        "attached_error",
+        "null_error",
+        "choice_error",
+        "usage_error",
+        "late_error",
+        "bad_object",
+        "bad_created",
+        "bool_created",
+        "hang_after_done",
+        "missing_object",
+        "missing_created",
+        "later_wrong_prompt",
     ],
 )
 def test_invalid_stream_retains_evidence(
     smoke: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
 ) -> None:
-    with endpoint() as (direct, _), endpoint(mode) as (proxy, _):
-        extra = ("--deadline-seconds", "0.1") if mode == "timeout" else ()
+    with endpoint() as (direct, _), endpoint(mode, role="proxy") as (proxy, _):
+        extra = (
+            ("--deadline-seconds", "0.1")
+            if mode in {"timeout", "hang_after_done"}
+            else ()
+        )
         code, report = invoke(smoke, monkeypatch, tmp_path, direct, proxy, *extra)
     assert code != 0
     assert report["status"] == "FAIL"
     assert report["error"]
+    case = json.loads((tmp_path / "evidence" / "evidence.json").read_text())["cases"][0]
+    arm = case["proxy"]
+    assert arm["status"] == ("PASS" if mode == "mismatch" else "FAIL")
+    assert arm["http_status"] == (500 if mode == "http_error" else 200)
+    assert arm["started_unix_ns"] > 0
+    assert arm["started_monotonic_seconds"] > 0
+    assert arm["elapsed_seconds"] >= 0
+    assert (
+        arm["ttft_seconds"] is None
+        or 0 <= arm["ttft_seconds"] <= arm["elapsed_seconds"]
+    )
+    if mode in {"bad_usage", "hang_after_done"}:
+        assert arm["ttft_seconds"] is not None
+        assert arm["token_ids"] == [7, 8]
+    if mode != "mismatch":
+        assert arm["error"]
     assert (tmp_path / "evidence" / "0-proxy.sse").stat().st_size > 0
     assert (tmp_path / "evidence" / "0-proxy.sse").stat().st_size <= 4 * 1024 * 1024
 
@@ -230,7 +414,7 @@ def test_invalid_stream_retains_evidence(
 def test_missing_receipt_refused(
     smoke: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
 ) -> None:
-    with endpoint(mode) as (direct, requests), endpoint() as (proxy, _):
+    with endpoint(mode) as (direct, requests), endpoint(role="proxy") as (proxy, _):
         code, report = invoke(smoke, monkeypatch, tmp_path, direct, proxy)
     assert code == 1
     assert report["status"] == "FAIL"
