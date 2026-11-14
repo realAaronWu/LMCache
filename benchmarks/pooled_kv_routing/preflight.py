@@ -7,6 +7,7 @@ See preflight-contract.md for the input schema and evidence trust boundary.
 
 # Standard
 from pathlib import Path
+from typing import TypedDict, cast
 import argparse
 import hashlib
 import json
@@ -29,6 +30,18 @@ ENV_KEYS = {
     "image_digest",
     "artifact",
 }
+
+
+class PreflightReport(TypedDict):
+    """Serialized qualification result; statuses retain their runtime checks."""
+
+    schema_version: int
+    evidence_status: str
+    functional_status: str
+    eligible_for_primary: bool
+    performance_status: str
+    checks: dict[str, dict[str, str]]
+    diagnostics: list[str]
 
 
 def _object(value: object, keys: set[str]) -> dict:
@@ -380,7 +393,7 @@ def _native(cfg: dict, nodes: list[dict]) -> None:
             raise ValueError("unexpected external fetch for local/miss/skip")
 
 
-def preflight(config: dict) -> dict:
+def preflight(config: dict[str, object]) -> PreflightReport:
     """Validate a frozen config and return JSON-serializable evidence statuses.
 
     Args:
@@ -392,9 +405,9 @@ def preflight(config: dict) -> dict:
         Invalid config/evidence returns FAIL, not an exception or empty result.
         No currently audited source head has qualified primary resource safety.
     """
-    checks = {}
-    errors = []
-    report = {
+    checks: dict[str, dict[str, str]] = {}
+    errors: list[str] = []
+    report: PreflightReport = {
         "schema_version": 2,
         "evidence_status": "FAIL",
         "functional_status": "NOT RUN",
@@ -455,7 +468,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", required=True)
     args = parser.parse_args(argv)
     try:
-        config = _json(_read(args.config, JSON_LIMIT))
+        # Preflight validates this untrusted value before any CLI indexing.
+        config = cast(dict[str, object], _json(_read(args.config, JSON_LIMIT)))
         report = preflight(config)
     except (ValueError, OSError, RecursionError) as exc:
         report = preflight({})
