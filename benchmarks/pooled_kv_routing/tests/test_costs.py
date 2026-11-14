@@ -85,6 +85,23 @@ def test_queue_plus_service_overflow_rejected() -> None:
         estimate(request, worker, "native_load", table)
 
 
+@pytest.mark.parametrize(
+    ("service", "completion"),
+    [(10**400, None), (1, 10**400)],
+    ids=["service", "completion"],
+)
+def test_huge_integer_cost_rejected_as_value_error(
+    service: int, completion: int | None
+) -> None:
+    with pytest.raises(ValueError, match="finite nonnegative milliseconds"):
+        CostEntry(
+            CostKey(1, 1, None, None, 0, "native_load"),
+            service,
+            "raw",
+            completion_ms=completion,
+        )
+
+
 def test_measured_fetch_paths_are_distinct_and_skip_ignores_path() -> None:
     request = RouteRequest("r", (1, 2), 1, 0)
     local_key = CostKey(2, 1, 2, 0, 0, "native_load", fetch_path="local_host")

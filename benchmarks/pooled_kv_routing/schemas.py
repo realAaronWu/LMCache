@@ -20,12 +20,16 @@ def nonnegative_int(value: int, name: str) -> None:
 
 def finite_ms(value: float, name: str) -> None:
     """Validate finite nonnegative milliseconds; raise ValueError on bad input."""
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-        or value < 0
-    ):
+    try:
+        invalid = (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        )
+    except OverflowError as exc:
+        raise ValueError(f"{name} must be finite nonnegative milliseconds") from exc
+    if invalid:
         raise ValueError(f"{name} must be finite nonnegative milliseconds")
 
 
