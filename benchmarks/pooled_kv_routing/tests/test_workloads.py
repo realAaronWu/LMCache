@@ -30,6 +30,14 @@ class Corpus(TypedDict):
     families: list[CorpusFamily]
 
 
+class TraceSpecChanges(TypedDict, total=False):
+    corpus_sha256: str
+    background_fraction: float
+    prefix_tokens: int
+    arrival_rate: float
+    tokenizer_revision: str
+
+
 @pytest.fixture
 def spec(tmp_path: Path) -> workloads.TraceSpec:
     # Synthetic token IDs test serialization, not semantic workload efficacy.
@@ -99,7 +107,7 @@ def test_trace_is_content_split_seeded_and_background_counted(
     ],
 )
 def test_trace_rejects_unfrozen_inputs(
-    spec: workloads.TraceSpec, change: dict[str, str | float | int]
+    spec: workloads.TraceSpec, change: TraceSpecChanges
 ) -> None:
     with pytest.raises(ValueError):
         workloads.generate(replace(spec, **change), 101)
