@@ -7,6 +7,7 @@ from typing import Literal
 import math
 
 LoadMode = Literal["native_load", "skip_external"]
+FetchPath = Literal["local_host", "remote_host"]
 Policy = Literal["cost", "lew", "static"]
 STALE_NS = 300_000_000
 
@@ -62,6 +63,8 @@ class WorkerSnapshot:
     pending_work_ms/pending_requests include ingress reservations. Prefix counts
     describe the current request only; a caller must not reuse them for another.
     sampled_ns is the observation time, never refreshed by local reservation.
+    fetch_path describes confirmed native host retrieval for this request;
+    None is unknown, not a reachable-remote assertion or a wildcard.
     """
 
     worker_id: str
@@ -73,6 +76,7 @@ class WorkerSnapshot:
     gpu_cached_prefix_tokens: int | None = None
     pending_requests: int = 0
     epoch: str | None = None
+    fetch_path: FetchPath | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -95,6 +99,8 @@ class WorkerSnapshot:
             not isinstance(self.epoch, str) or not self.epoch
         ):
             raise ValueError("epoch must be nonempty")
+        if self.fetch_path not in (None, "local_host", "remote_host"):
+            raise ValueError("invalid fetch_path")
 
 
 @dataclass(frozen=True)

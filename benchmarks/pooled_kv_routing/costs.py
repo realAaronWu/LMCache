@@ -7,6 +7,7 @@ from dataclasses import dataclass
 # Local
 from .schemas import (
     Estimate,
+    FetchPath,
     LoadMode,
     RouteRequest,
     WorkerSnapshot,
@@ -20,7 +21,9 @@ class CostKey:
     """Measured service condition, including output budget and concurrency.
 
     None denotes a specifically measured unknown-prefix condition, not zero.
-    skip_external keys require cached_prefix_tokens=None but retain GPU reuse.
+    skip_external keys require cached_prefix_tokens/fetch_path=None but retain
+    GPU reuse. Native fetch_path=None is a measured unknown condition, not a
+    wildcard matching either local-host or remote-host measurements.
     """
 
     prompt_tokens: int
@@ -29,6 +32,7 @@ class CostKey:
     gpu_cached_prefix_tokens: int | None
     pending_requests: int
     load_mode: LoadMode
+    fetch_path: FetchPath | None = None
 
     def __post_init__(self) -> None:
         for name in ("prompt_tokens", "max_tokens", "pending_requests"):
@@ -42,8 +46,12 @@ class CostKey:
                     raise ValueError("prefix exceeds prompt")
         if self.load_mode not in ("native_load", "skip_external"):
             raise ValueError("invalid load_mode")
-        if self.load_mode == "skip_external" and self.cached_prefix_tokens is not None:
-            raise ValueError("skip_external ignores external prefix")
+        if self.fetch_path not in (None, "local_host", "remote_host"):
+            raise ValueError("invalid fetch_path")
+        if self.load_mode == "skip_external" and (
+            self.cached_prefix_tokens is not None or self.fetch_path is not None
+        ):
+            raise ValueError("skip_external ignores external prefix and fetch_path")
 
 
 @dataclass(frozen=True)
@@ -132,7 +140,7 @@ def estimate(
     Returns:
         Estimate: Finite prediction or an explicit unknown-bucket diagnostic.
     Raises:
-        ValueError: Invalid mode or prefix count exceeding the prompt.
+        ValueError: Invalid mode/prefix or unrepresentable queue-plus-service sum.
     """
     key = CostKey(
         len(request.token_ids),
@@ -141,6 +149,7 @@ def estimate(
         worker.gpu_cached_prefix_tokens,
         worker.pending_requests,
         mode,
+        worker.fetch_path if mode == "native_load" else None,
     )
     service_ms = costs.lookup(key)
     if service_ms is None:

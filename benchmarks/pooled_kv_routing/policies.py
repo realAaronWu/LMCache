@@ -15,6 +15,7 @@ from .schemas import (
     RouterConfig,
     RouteRequest,
     WorkerSnapshot,
+    finite_ms,
 )
 
 
@@ -44,7 +45,8 @@ def choose(
     Returns:
         RouteDecision: Executable choice and candidate diagnostics.
     Raises:
-        ValueError: Future inputs, duplicate IDs, or no healthy eligible worker.
+        ValueError: Future inputs, duplicate IDs, no healthy eligible worker, or
+            unrepresentable derived costs/static cache credit.
     """
     if config.now_ns < request.arrival_ns or any(
         w.sampled_ns > config.now_ns for w in snapshots
@@ -102,26 +104,26 @@ def choose(
         )
     baseline_policy = config.policy if config.policy != "cost" else config.baseline
     baseline_mode = config.baseline_load_mode
-    baseline = min(
-        fresh,
-        key=lambda w: (
-            w.pending_work_ms
-            - (
-                config.alpha_ms_per_token
-                * (
-                    (
-                        w.cached_prefix_tokens
-                        if baseline_mode == "native_load"
-                        else w.gpu_cached_prefix_tokens
-                    )
-                    or 0
-                )
-                if baseline_policy == "static"
-                else 0
-            ),
-            _tie(request.request_id, w.worker_id, baseline_mode),
-        ),
-    )
+    baseline_scores: list[tuple[float, bytes, WorkerSnapshot]] = []
+    for worker in fresh:
+        credit = 0.0
+        if baseline_policy == "static":
+            prefix = (
+                worker.cached_prefix_tokens
+                if baseline_mode == "native_load"
+                else worker.gpu_cached_prefix_tokens
+            )
+            credit = config.alpha_ms_per_token * (prefix or 0)
+            finite_ms(credit, "static_cache_credit_ms")
+        # Subtracting finite nonnegative operands cannot overflow either sign.
+        baseline_scores.append(
+            (
+                worker.pending_work_ms - credit,
+                _tie(request.request_id, worker.worker_id, baseline_mode),
+                worker,
+            )
+        )
+    baseline = min(baseline_scores, key=lambda item: (item[0], item[1]))[2]
     chosen = next(
         c
         for c in candidates
