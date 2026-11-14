@@ -129,10 +129,35 @@ def _ref(ref: object, limit: int = RAW_LIMIT) -> bytes:
     return _read(path, limit, ref["sha256"])
 
 
-def _raw(refs: object) -> None:
-    """Require retained raw evidence instead of an unbacked summary."""
-    for ref in _sequence(refs, 1, 16):
-        _ref(ref)
+def _capture(ref: object, role: str, identity: dict) -> dict:
+    """Read one authoritative collector record, never a success summary.
+
+    The collector writes terminal only after child exit and complete structured
+    output collection. Diagnostic logs are retained but cannot override it.
+    """
+    record = _object(
+        _json(_ref(ref, JSON_LIMIT)),
+        {
+            "schema_version",
+            "role",
+            "identity",
+            "terminal",
+            "returncode",
+            "observation",
+            "logs",
+        },
+    )
+    _integer(record["schema_version"], 2, 2)
+    if record["role"] != role or record["identity"] != identity:
+        raise ValueError(f"misassociated {role} capture identity")
+    if record["terminal"] != "completed":
+        raise ValueError(f"incomplete {role} capture")
+    _integer(record["returncode"], 0, 0)
+    for log in _sequence(record["logs"], 1, 16):
+        _ref(log)
+    if type(record["observation"]) is not dict:
+        raise ValueError("capture observation must be an object")
+    return record["observation"]
 
 
 def _configuration(config: object) -> dict:
@@ -141,6 +166,7 @@ def _configuration(config: object) -> dict:
         config,
         {
             "schema_version",
+            "run_id",
             "scope",
             "source",
             "model",
@@ -149,7 +175,8 @@ def _configuration(config: object) -> dict:
             "native_evidence",
         },
     )
-    _integer(cfg["schema_version"], 1, 1)
+    _integer(cfg["schema_version"], 2, 2)
+    _text(cfg["run_id"])
     if cfg["scope"] not in ("functional_single_gpu", PRIMARY):
         raise ValueError("unknown qualification scope")
     source = _object(cfg["source"], {"base", "head", "patch_sha256", "artifact"})
@@ -171,7 +198,25 @@ def _configuration(config: object) -> dict:
             raise ValueError("duplicate model payload")
         paths.add(ref["path"])
     env = _object(cfg["environment"], ENV_KEYS)
-    _ref(env["artifact"])
+    observed = _capture(
+        env["artifact"],
+        "environment",
+        {"run_id": cfg["run_id"], "source_head": source["head"]},
+    )
+    _object(observed, ENV_KEYS - {"artifact"} | {"binaries", "argv"})
+    if {k: observed[k] for k in ENV_KEYS - {"artifact"}} != {
+        k: v for k, v in env.items() if k != "artifact"
+    }:
+        raise ValueError("environment capture differs from frozen versions")
+    binaries = _sequence(observed["binaries"], 1, 256)
+    binary_paths = set()
+    for binary in binaries:
+        _ref(binary, MODEL_LIMIT)
+        if binary["path"] in binary_paths:
+            raise ValueError("duplicate environment binary")
+        binary_paths.add(binary["path"])
+    for arg in _sequence(observed["argv"], 1, 256):
+        _text(arg)
     for key in ENV_KEYS - {"image_digest", "artifact"}:
         value = env[key]
         _text(value)
@@ -190,7 +235,11 @@ def _inventory(cfg: dict) -> list[dict]:
     nodes = []
     for ref in cfg["nodes"]:
         node = _object(
-            _json(_ref(ref, JSON_LIMIT)),
+            _capture(
+                ref,
+                "inventory",
+                {"run_id": cfg["run_id"], "source_head": cfg["source"]["head"]},
+            ),
             {
                 "host_id",
                 "gpu_uuid",
@@ -202,7 +251,6 @@ def _inventory(cfg: dict) -> list[dict]:
                 "source",
                 "model",
                 "environment",
-                "raw",
             },
         )
         for field in ("host_id", "gpu_uuid", "gpu_model"):
@@ -219,7 +267,6 @@ def _inventory(cfg: dict) -> list[dict]:
         for key in ("source", "model", "environment"):
             if node[key] != cfg[key]:
                 raise ValueError(f"observed {key} differs from frozen provenance")
-        _raw(node["raw"])
         nodes.append(node)
     if cfg["scope"] == PRIMARY:
         if len(nodes) != 2:
@@ -243,7 +290,9 @@ def _native(cfg: dict, nodes: list[dict]) -> None:
     probe = _object(
         _json(_ref(cfg["native_evidence"], JSON_LIMIT)), {"provenance_sha256", "cases"}
     )
-    provenance = {key: cfg[key] for key in ("source", "model", "environment", "nodes")}
+    provenance = {
+        key: cfg[key] for key in ("run_id", "source", "model", "environment", "nodes")
+    }
     expected = hashlib.sha256(
         json.dumps(provenance, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -262,16 +311,10 @@ def _native(cfg: dict, nodes: list[dict]) -> None:
             case,
             {
                 "name",
-                "returncode",
                 "request_id",
                 "host_ids",
-                "transport",
-                "remote_bytes",
-                "external_fetches",
-                "expected_token_ids",
-                "actual_token_ids",
-                "loader_extra_args",
-                "raw",
+                "reference",
+                "probe",
             },
         )
         name = _text(case["name"])
@@ -280,37 +323,61 @@ def _native(cfg: dict, nodes: list[dict]) -> None:
             raise ValueError("missing/duplicate native case or request")
         seen.add(name)
         request_ids.add(request_id)
-        _integer(case["returncode"], 0, 0)
-        for field in ("remote_bytes", "external_fetches"):
-            _integer(case[field])
-        for field in ("expected_token_ids", "actual_token_ids"):
-            for token in _sequence(case[field], 1, 65536):
-                _integer(token, 0, 2**31 - 1)
-        if case["expected_token_ids"] != case["actual_token_ids"]:
-            raise ValueError("native output token mismatch")
         hosts = [node["host_id"] for node in nodes]
         if name == "B_to_A":
             hosts.reverse()
         if case["host_ids"] != hosts:
             raise ValueError("native case host identity/direction mismatch")
+        identity = {
+            "run_id": cfg["run_id"],
+            "provenance_sha256": expected,
+            "name": name,
+            "request_id": request_id,
+            "host_ids": hosts,
+        }
+        reference = _object(
+            _capture(case["reference"], "reference", identity),
+            {"token_ids", "token_count"},
+        )
+        observation = _object(
+            _capture(case["probe"], "probe", identity),
+            {
+                "token_ids",
+                "token_count",
+                "transport",
+                "remote_bytes",
+                "external_fetches",
+                "loader_extra_args",
+            },
+        )
+        for output in (reference, observation):
+            tokens = _sequence(output["token_ids"], 1, 65536)
+            _integer(output["token_count"], 1, 65536)
+            if output["token_count"] != len(tokens):
+                raise ValueError("incomplete token output inventory")
+            for token in tokens:
+                _integer(token, 0, 2**31 - 1)
+        if reference["token_ids"] != observation["token_ids"]:
+            raise ValueError("native output token mismatch")
+        for field in ("remote_bytes", "external_fetches"):
+            _integer(observation[field])
         _object(
-            case["loader_extra_args"],
+            observation["loader_extra_args"],
             {"lmcache.skip_load"} if name == "skip_load" else set(),
         )
         if (
             name == "skip_load"
-            and case["loader_extra_args"]["lmcache.skip_load"] is not True
+            and observation["loader_extra_args"]["lmcache.skip_load"] is not True
         ):
             raise ValueError("loader did not observe skip flag")
-        if case["transport"] != ("rdma" if primary else "local"):
+        if observation["transport"] != ("rdma" if primary else "local"):
             raise ValueError("native transport is not qualified for requested scope")
         positive = primary and name not in ("miss", "skip_load")
         if positive:
-            if case["remote_bytes"] <= 0 or case["external_fetches"] <= 0:
+            if observation["remote_bytes"] <= 0 or observation["external_fetches"] <= 0:
                 raise ValueError("remote read not observed")
-        elif case["remote_bytes"] != 0 or case["external_fetches"] != 0:
+        elif observation["remote_bytes"] != 0 or observation["external_fetches"] != 0:
             raise ValueError("unexpected external fetch for local/miss/skip")
-        _raw(case["raw"])
 
 
 def preflight(config: dict) -> dict:
@@ -328,7 +395,7 @@ def preflight(config: dict) -> dict:
     checks = {}
     errors = []
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "evidence_status": "FAIL",
         "functional_status": "NOT RUN",
         "eligible_for_primary": False,
