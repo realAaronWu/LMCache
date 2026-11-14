@@ -208,38 +208,48 @@ class Telemetry:
                 worker_id, estimated_ms
             )
 
-    def confirmed_complete(self, request_id: str, now_ns: int) -> None:
+    def confirmed_complete(
+        self, request_id: str, now_ns: int, *, worker_id: str | None = None
+    ) -> None:
         """Release work only after confirmed worker termination (any status).
 
         Args:
             request_id (str): Previously reserved nonterminal request.
             now_ns (int): Confirmation time, not client disconnect time.
+            worker_id (str | None): If supplied, must match the reservation owner.
         Raises:
-            ValueError: Duplicate terminal or time reversal.
+            ValueError: Duplicate terminal, owner mismatch or time reversal.
             KeyError: Unknown request ID.
         """
         with self._lock:
             if request_id in self._completed:
                 raise ValueError("duplicate terminal")
-            self._reservations[request_id]
+            reservation = self._reservations[request_id]
+            if worker_id is not None and worker_id != reservation.worker_id:
+                raise ValueError("worker_id does not match reservation owner")
             self._advance(now_ns)
             del self._reservations[request_id]
             self._completed.add(request_id)
 
-    def cancel_unconfirmed(self, request_id: str, now_ns: int) -> None:
+    def cancel_unconfirmed(
+        self, request_id: str, now_ns: int, *, worker_id: str | None = None
+    ) -> None:
         """Taint a worker and retain all reserved work pending terminal evidence.
 
         Args:
             request_id (str): Active reservation with unconfirmed cancellation.
             now_ns (int): Time cancellation became uncertain.
+            worker_id (str | None): If supplied, must match the reservation owner.
         Raises:
-            ValueError: Already terminal request or time reversal.
+            ValueError: Already terminal, owner mismatch or time reversal.
             KeyError: Unknown request ID.
         """
         with self._lock:
             if request_id in self._completed:
                 raise ValueError("already terminal")
             reservation = self._reservations[request_id]
+            if worker_id is not None and worker_id != reservation.worker_id:
+                raise ValueError("worker_id does not match reservation owner")
             self._advance(now_ns)
             self._tainted.add(reservation.worker_id)
             self._invalidate(reservation.worker_id)
