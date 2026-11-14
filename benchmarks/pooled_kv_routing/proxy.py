@@ -94,7 +94,7 @@ def _validate(body: dict[str, object], limits: "ProxyLimits") -> str:
         raise ValueError("stream=true and n=1 required")
     if "arrival_ns" in body:
         _integer(body["arrival_ns"])
-    if body.get("echo", False) is not False or body.get("best_of", 1) != 1:
+    if body.get("echo", False) is not False or _integer(body.get("best_of", 1), 1) != 1:
         raise ValueError("echo and best_of are unsupported")
     if "extra_args" in body:
         raise ValueError("use top-level kv_transfer_params, not extra_args")
@@ -347,7 +347,10 @@ class _Observer:
             tokens = choice.get("token_ids", [])
             if not isinstance(tokens, list):
                 raise ValueError("token_ids must be a list")
-            if choice.get("text") and not tokens:
+            text = choice.get("text", "")
+            if not isinstance(text, str):
+                raise ValueError("completion text must be a string when present")
+            if text and not tokens:
                 raise ValueError("generated text without worker token IDs")
             if self.finish_reason is not None:
                 raise ValueError("choice after finish reason")
@@ -387,6 +390,8 @@ def create_app(
             failures. Must finish within request_timeout_s. Empty worker_id means
             routing never selected a worker. Only complete protocol evidence sets
             worker_terminal_confirmed; HTTP close alone never does.
+            Attempt/result events are durable and the callback is never retried.
+            Failure/timeout blocks new admissions pending external reconciliation.
         limits: Positive body/token/stream/admission/deadline bounds.
         transport: Optional httpx transport for CPU fixtures, closed per request.
 
@@ -402,24 +407,52 @@ def create_app(
         GPU/P2P qualification. All events use this process's monotonic clock.
         Deadline begins at ingress; arrival_ns is preserved, not trusted as this
         host's clock. Client must enforce its scheduled-arrival deadline too.
+        max_inflight bounds body readers as well as admitted streams; a full app
+        returns 503 before reading the body. The slot remains held through callback
+        accounting and is released on every input/stream exit. Optional completion
+        text must be a string when present; absent text permits token-only events.
     """
     app = FastAPI()
     journal = _Journal(journal_path)
     seen: set[str] = set()
     tainted: set[str] = set()
     inflight = 0
+    accounting_failed = False
 
     @app.post("/v1/completions", response_model=None)
     async def completions(request: Request) -> JSONResponse | StreamingResponse:
         nonlocal inflight
+        if accounting_failed or inflight >= limits.max_inflight:
+            return JSONResponse({"error": "ingress full or accounting failed"}, 503)
+        inflight += 1
+        handed_off = False
+        released = False
+
+        def release() -> None:
+            nonlocal inflight, released
+            if not released:
+                released = True
+                inflight -= 1
+
+        try:
+            response = await accept(request, release)
+            handed_off = isinstance(response, _OwnedStreamingResponse)
+            return response
+        finally:
+            if not handed_off:
+                release()
+
+    async def accept(
+        request: Request, release: Callable[[], None]
+    ) -> JSONResponse | StreamingResponse:
         ingress_ns = time.monotonic_ns()
         try:
             raw = bytearray()
             with anyio.fail_after(limits.request_timeout_s):
                 async for chunk in request.stream():
-                    raw.extend(chunk)
-                    if len(raw) > limits.max_body_bytes:
+                    if len(raw) + len(chunk) > limits.max_body_bytes:
                         return JSONResponse({"error": "body exceeds bound"}, 413)
+                    raw.extend(chunk)
             body = _object(bytes(raw))
             rid = _validate(body, limits)
         except (ValueError, UnicodeError):
@@ -433,9 +466,6 @@ def create_app(
         if len(seen) >= limits.max_requests:
             return JSONResponse({"error": "request inventory full"}, 503)
         seen.add(rid)
-        journal.record("ingress", rid, ingress_ns=ingress_ns, request=body)
-        overloaded = inflight >= limits.max_inflight
-        inflight += 1
 
         worker_id = ""
         status: FinishStatus = "error"
@@ -450,33 +480,85 @@ def create_app(
         )
 
         async def finalize() -> None:
-            nonlocal inflight
-            nonlocal finalized
+            nonlocal finalized, status, diagnostic, accounting_failed
             if finalized:
                 return
             finalized = True
             if dispatched and not confirmed:
                 tainted.add(worker_id)
-            inflight -= 1
+            completion_status = status
+            accounting_status = "not_configured"
             with anyio.CancelScope(shield=True):
                 try:
-                    journal.record(
-                        "end",
-                        rid,
-                        worker_id=worker_id,
-                        status=status,
-                        worker_terminal_confirmed=confirmed,
-                        diagnostic=diagnostic,
-                        token_ids=observer.tokens,
-                        usage=observer.usage,
-                        finish_reason=observer.finish_reason,
-                    )
-                finally:
                     if on_finish is not None:
-                        with anyio.fail_after(limits.request_timeout_s):
-                            await on_finish(
-                                ProxyFinish(rid, worker_id, status, confirmed)
+                        try:
+                            # Even a failed journal write must not skip the sole
+                            # callback attempt for an already reserved ID.
+                            try:
+                                journal.record(
+                                    "callback_attempt",
+                                    rid,
+                                    completion_status=completion_status,
+                                )
+                            finally:
+                                with anyio.fail_after(limits.request_timeout_s):
+                                    await on_finish(
+                                        ProxyFinish(rid, worker_id, status, confirmed)
+                                    )
+                            accounting_status = "success"
+                        except BaseException as exc:
+                            # A partially committed ledger cannot be retried.
+                            logger.exception("Finish accounting failed")
+                            accounting_failed = True
+                            accounting_status = (
+                                "timeout" if isinstance(exc, TimeoutError) else "error"
                             )
+                            status = (
+                                "timeout" if isinstance(exc, TimeoutError) else "error"
+                            )
+                            diagnostic = f"finish accounting {accounting_status}: {exc}"
+                            if not isinstance(exc, Exception):
+                                raise
+                        finally:
+                            journal.record(
+                                "callback_result",
+                                rid,
+                                outcome=accounting_status,
+                                diagnostic=diagnostic,
+                            )
+                except OSError:
+                    accounting_failed = True
+                    status = "error"
+                    diagnostic = "accounting journal write failed"
+                    raise
+                finally:
+                    try:
+                        if (
+                            status == "success"
+                            and time.monotonic_ns() - ingress_ns
+                            >= limits.request_timeout_s * 1e9
+                        ):
+                            status = "timeout"
+                            diagnostic = "deadline elapsed during finish accounting"
+                        journal.record(
+                            "end",
+                            rid,
+                            worker_id=worker_id,
+                            status=status,
+                            completion_status=completion_status,
+                            accounting_status=accounting_status,
+                            worker_terminal_confirmed=confirmed,
+                            diagnostic=diagnostic,
+                            token_ids=observer.tokens,
+                            usage=observer.usage,
+                            finish_reason=observer.finish_reason,
+                        )
+                    except OSError:
+                        logger.exception("Terminal journal failed")
+                        accounting_failed = True
+                        raise
+                    finally:
+                        release()
 
         async def produce(
             sender: anyio.abc.ObjectSendStream[bytes | Exception],
@@ -487,9 +569,6 @@ def create_app(
                     limits.request_timeout_s - (time.monotonic_ns() - ingress_ns) / 1e9
                 )
                 with anyio.fail_after(max(0, remaining)):
-                    if overloaded:
-                        status = "overload"
-                        raise ValueError("inflight bound exceeded")
                     decision = await route(copy.deepcopy(body))
                     worker_id = decision.worker_id
                     if (
@@ -590,7 +669,7 @@ def create_app(
                 raise
             finally:
                 await finalize()
-            if confirmed:
+            if status == "success":
                 await sender.send(b"data: [DONE]\n\n")
             else:
                 await sender.send(
@@ -642,6 +721,12 @@ def create_app(
                     finally:
                         receiver.close()
 
+        try:
+            journal.record("ingress", rid, ingress_ns=ingress_ns, request=body)
+        except OSError:
+            logger.exception("Ingress journal failed")
+            await finalize()
+            raise
         return _OwnedStreamingResponse(
             stream(), cleanup, rid, ingress_ns / 1e9 + limits.request_timeout_s
         )
