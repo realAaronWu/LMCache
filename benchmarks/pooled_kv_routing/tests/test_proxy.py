@@ -151,6 +151,11 @@ def test_valid_entry_journals_actual_tokens_and_injects_mode(tmp_path: Path) -> 
     terminal = records[-1]
     assert terminal["event"] == "end" and terminal["token_ids"] == [42]
     assert terminal["status"] == "success"
+    assert terminal["accounting_status"] == "success"
+    assert sum(r["event"] == "callback_attempt" for r in records) == 1
+    assert [r["outcome"] for r in records if r["event"] == "callback_result"] == [
+        "success"
+    ]
     assert {r["event"] for r in records} >= {
         "ingress",
         "dispatch",
@@ -550,6 +555,10 @@ def test_deadline_during_automatic_eof_close_does_not_interrupt_cleanup(
 ) -> None:
     async def run() -> None:
         closed = asyncio.Event()
+        finished: list[ProxyFinish] = []
+
+        async def finish(result: ProxyFinish) -> None:
+            finished.append(result)
 
         class Stream(httpx.AsyncByteStream):
             async def __aiter__(self) -> AsyncIterator[bytes]:
@@ -571,16 +580,233 @@ def test_deadline_during_automatic_eof_close_does_not_interrupt_cleanup(
         app = create_app(
             route,
             tmp_path / "journal.jsonl",
+            on_finish=finish,
             transport=httpx.MockTransport(worker),
             limits=ProxyLimits(request_timeout_s=0.03),
         )
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app), base_url="http://proxy"
         ) as client:
-            try:
-                await client.post("/v1/completions", json=payload())
-            except TimeoutError:
-                pass
+            response = await client.post("/v1/completions", json=payload())
         assert closed.is_set()
+        assert b"data: [DONE]" not in response.content
+        assert finished == [ProxyFinish("r1", "w1", "timeout", True)]
+        end = json.loads((tmp_path / "journal.jsonl").read_text().splitlines()[-1])
+        assert end["status"] == "timeout" and end["worker_terminal_confirmed"]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("text", [{"wrong": "type"}, [], 1, True, None])
+def test_recognized_text_requires_string(tmp_path: Path, text: object) -> None:
+    raw = valid_stream().replace(
+        b'"text": "hi"', b'"text": ' + json.dumps(text).encode()
+    )
+    response, _, finished, records = asyncio.run(exercise(tmp_path, raw))
+    assert b"data: [DONE]" not in response.content
+    assert finished[0].status == "error"
+    assert records[-1]["status"] == "error"
+
+
+@pytest.mark.parametrize("best_of", [True, 1.0])
+def test_best_of_requires_exact_integer(tmp_path: Path, best_of: object) -> None:
+    response, sent, finished, _ = asyncio.run(
+        exercise(tmp_path, valid_stream(), payload() | {"best_of": best_of})
+    )
+    assert response.status_code == 422
+    assert sent == [] and finished == []
+
+
+@pytest.mark.parametrize("failure", ["error", "timeout"])
+def test_finish_failure_is_durable_exact_once_and_stops_admission(
+    tmp_path: Path, failure: str
+) -> None:
+    async def run() -> None:
+        calls: list[ProxyFinish] = []
+
+        async def route(body: dict[str, object]) -> ProxyRoute:
+            return ProxyRoute("w1", "http://worker/v1/completions", "native_load", {})
+
+        async def worker(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                content=valid_stream(),
+                headers={"content-type": "text/event-stream"},
+            )
+
+        async def finish(result: ProxyFinish) -> None:
+            calls.append(result)
+            if failure == "timeout":
+                await asyncio.sleep(1)
+            else:
+                raise RuntimeError("ledger commit rejected")
+
+        path = tmp_path / "journal.jsonl"
+        app = create_app(
+            route,
+            path,
+            on_finish=finish,
+            transport=httpx.MockTransport(worker),
+            limits=ProxyLimits(request_timeout_s=0.1),
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app), base_url="http://proxy"
+        ) as client:
+            response = await client.post("/v1/completions", json=payload())
+            assert b"data: [DONE]" not in response.content
+            rejected = await client.post("/v1/completions", json=payload("r2"))
+            assert rejected.status_code == 503
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        assert calls == [ProxyFinish("r1", "w1", "success", True)]
+        assert sum(r["event"] == "callback_attempt" for r in records) == 1
+        results = [r for r in records if r["event"] == "callback_result"]
+        assert len(results) == 1 and results[0]["outcome"] == failure
+        assert records[-1]["event"] == "end"
+        assert records[-1]["status"] == failure
+        assert records[-1]["completion_status"] == "success"
+        assert records[-1]["accounting_status"] == failure
+        assert records[-1]["worker_terminal_confirmed"] is True
+
+    asyncio.run(run())
+
+
+def test_ingress_slots_bound_readers_and_release_on_cancellation(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        readers: list[int] = []
+        started = asyncio.Event()
+
+        class SlowBody(httpx.AsyncByteStream):
+            async def __aiter__(self) -> AsyncIterator[bytes]:
+                readers.append(1)
+                started.set()
+                yield b'{"partial":'
+                await asyncio.sleep(10)
+
+        async def route(body: dict[str, object]) -> ProxyRoute:
+            return ProxyRoute("w1", "http://worker/v1/completions", "native_load", {})
+
+        async def worker(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                content=valid_stream(),
+                headers={"content-type": "text/event-stream"},
+            )
+
+        app = create_app(
+            route,
+            tmp_path / "journal.jsonl",
+            limits=ProxyLimits(max_inflight=1),
+            transport=httpx.MockTransport(worker),
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app), base_url="http://proxy"
+        ) as client:
+            pending = asyncio.create_task(
+                client.post("/v1/completions", content=SlowBody())
+            )
+            await asyncio.wait_for(started.wait(), 1)
+            rejected = await asyncio.gather(
+                *(client.post("/v1/completions", content=SlowBody()) for _ in range(3))
+            )
+            assert [r.status_code for r in rejected] == [503] * 3
+            assert readers == [1]
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+            assert (
+                await client.post("/v1/completions", json=payload())
+            ).content.endswith(b"data: [DONE]\n\n")
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", ["invalid", "oversize", "timeout", "disconnect"])
+def test_ingress_slot_released_on_body_failures(tmp_path: Path, failure: str) -> None:
+    async def run() -> None:
+        class Body(httpx.AsyncByteStream):
+            async def __aiter__(self) -> AsyncIterator[bytes]:
+                if failure == "timeout":
+                    await asyncio.sleep(1)
+                if failure == "disconnect":
+                    raise ClientDisconnect()
+                yield b"x" * (2048 if failure == "oversize" else 1)
+
+        async def route(body: dict[str, object]) -> ProxyRoute:
+            return ProxyRoute("w1", "http://worker/v1/completions", "native_load", {})
+
+        async def worker(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                content=valid_stream(),
+                headers={"content-type": "text/event-stream"},
+            )
+
+        app = create_app(
+            route,
+            tmp_path / "journal.jsonl",
+            limits=ProxyLimits(
+                max_inflight=1, max_body_bytes=1024, request_timeout_s=0.1
+            ),
+            transport=httpx.MockTransport(worker),
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app), base_url="http://proxy"
+        ) as client:
+            if failure == "disconnect":
+                with pytest.raises(ClientDisconnect):
+                    await client.post("/v1/completions", content=Body())
+            else:
+                response = await client.post("/v1/completions", content=Body())
+                assert (
+                    response.status_code
+                    == {"invalid": 422, "oversize": 413, "timeout": 408}[failure]
+                )
+            assert (
+                await client.post("/v1/completions", json=payload())
+            ).content.endswith(b"data: [DONE]\n\n")
+
+    asyncio.run(run())
+
+
+def test_successful_callback_cannot_extend_success_past_request_deadline(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        calls: list[ProxyFinish] = []
+
+        async def route(body: dict[str, object]) -> ProxyRoute:
+            await asyncio.sleep(0.07)
+            return ProxyRoute("w1", "http://worker/v1/completions", "native_load", {})
+
+        async def worker(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                content=valid_stream(),
+                headers={"content-type": "text/event-stream"},
+            )
+
+        async def finish(result: ProxyFinish) -> None:
+            calls.append(result)
+            await asyncio.sleep(0.06)
+
+        path = tmp_path / "journal.jsonl"
+        app = create_app(
+            route,
+            path,
+            on_finish=finish,
+            transport=httpx.MockTransport(worker),
+            limits=ProxyLimits(request_timeout_s=0.1),
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app), base_url="http://proxy"
+        ) as client:
+            response = await client.post("/v1/completions", json=payload())
+        assert b"data: [DONE]" not in response.content
+        end = json.loads(path.read_text().splitlines()[-1])
+        assert end["status"] == "timeout"
+        assert end["accounting_status"] == "success"
+        assert calls == [ProxyFinish("r1", "w1", "success", True)]
 
     asyncio.run(run())
