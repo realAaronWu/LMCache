@@ -14,7 +14,12 @@ import pytest
 from benchmarks.pooled_kv_routing.costs import CostEntry, CostKey, CostTable
 from benchmarks.pooled_kv_routing.proxy import ProxyFinish, create_app
 from benchmarks.pooled_kv_routing.runtime import RoutingRuntime
-from benchmarks.pooled_kv_routing.schemas import RouterConfig, WorkerSnapshot
+from benchmarks.pooled_kv_routing.schemas import (
+    LoadMode,
+    Policy,
+    RouterConfig,
+    WorkerSnapshot,
+)
 from benchmarks.pooled_kv_routing.telemetry import Telemetry
 
 
@@ -23,11 +28,12 @@ def components(completion_ms: float | None = 20) -> tuple[RoutingRuntime, Teleme
         (WorkerSnapshot("A", "http://worker/v1/completions", True, 0, 0),),
         namespace="fixture",
     )
+    modes: tuple[LoadMode, ...] = ("native_load", "skip_external")
     costs = CostTable(
         "fixture-only",
         tuple(
             CostEntry(CostKey(2, 1, None, None, 0, mode), 5, "fixture", completion_ms)
-            for mode in ("native_load", "skip_external")
+            for mode in modes
         ),
     )
     runtime = RoutingRuntime(
@@ -63,7 +69,7 @@ def test_real_bridge_reserves_completion_not_queue_inclusive_ttft() -> None:
 )
 @pytest.mark.parametrize("complete", [True, False])
 def test_proxy_runtime_end_to_end_accounting(
-    tmp_path: Path, policy: str, mode: str, complete: bool
+    tmp_path: Path, policy: Policy, mode: LoadMode, complete: bool
 ) -> None:
     """Same real entry path for both policies, including uncertain completion."""
 
