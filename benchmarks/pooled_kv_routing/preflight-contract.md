@@ -120,9 +120,19 @@ safety FAILs; no config flag/report overrides this gate. Performance is always
 NOT RUN. Functional PASS never implies RDMA or >5% performance PASS.
 
 CLI: `python -m benchmarks.pooled_kv_routing.preflight --config FILE --output FILE`.
-Writes report; returns 0 only for functional evidence PASS. Unqualified primary,
+Creates a fresh report; returns 0 only for functional evidence PASS. Unqualified primary,
 invalid inputs and NOT RUN return 1. Argparse/output-write errors are normal
 nonzero CLI errors. Parent owns overall AC0-AC6 acceptance.
+
+Output creation is exclusive (`open("x")`). Every existing output is refused,
+including a prior valid report, config, raw capture, hardlink or symlink. Its
+bytes are preserved and the CLI exits nonzero without writing a new report.
+This intentionally removes the old in-place report-overwrite convenience:
+reruns, including failed reruns, must use a new path. A failure with a fresh
+output still writes FAIL. A preserved old PASS file belongs to its old run,
+not to the failed invocation; always inspect the current exit and new report.
+Fresh per-run paths match the benchmark plan. No nested reference walker or
+report-identity framework is needed to protect existing files.
 
 Limits: JSON/config <=1 MiB; logs/source <=64 MiB each; model/environment binary
 <=64 GiB each. All lists bounded above; streaming buffers <=1 MiB. No network,
