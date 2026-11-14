@@ -137,3 +137,49 @@ def test_content_leakage_and_duplicate_suffixes_rejected(
     leaked = replace(spec, corpus_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
     with pytest.raises(ValueError, match="reused prefix"):
         workloads.generate(leaked, 101)
+
+
+@pytest.mark.parametrize(
+    "target_name", ["config", "corpus", "symlink", "hardlink", "existing"]
+)
+def test_generate_cli_never_overwrites_inputs_or_existing_output(
+    spec: workloads.TraceSpec, tmp_path: Path, target_name: str
+) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps(asdict(spec)))
+    sha = hashlib.sha256(
+        json.dumps(asdict(spec), sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    corpus = Path(spec.corpus_path)
+    output = tmp_path / "output.json"
+    if target_name == "config":
+        output = config
+    elif target_name == "corpus":
+        output = corpus
+    elif target_name == "symlink":
+        output.symlink_to(corpus)
+    elif target_name == "hardlink":
+        output.hardlink_to(corpus)
+    else:
+        output.write_text("previous output")
+    originals = {path: path.read_bytes() for path in (config, corpus, output)}
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "benchmarks.pooled_kv_routing.workloads",
+            "generate",
+            "--config",
+            str(config),
+            "--config-sha256",
+            sha,
+            "--seed",
+            "101",
+            "--output",
+            str(output),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert all(path.read_bytes() == raw for path, raw in originals.items())
