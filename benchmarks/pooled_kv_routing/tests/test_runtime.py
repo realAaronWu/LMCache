@@ -180,6 +180,44 @@ def test_unknown_completion_work_is_not_invented_or_reserved() -> None:
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("worker_id", ["B", ""])
+@pytest.mark.parametrize("confirmed", [True, False])
+def test_finish_rejects_crossed_worker_without_changing_reservation(
+    worker_id: str, confirmed: bool
+) -> None:
+    async def run() -> None:
+        runtime, state = components()
+        await runtime.route({"request_id": "one", "prompt": [1, 2], "max_tokens": 1})
+        before = state.snapshot(100)
+        with pytest.raises(ValueError):
+            await runtime.finish(
+                ProxyFinish(
+                    "one", worker_id, "success" if confirmed else "error", confirmed
+                )
+            )
+        assert state.snapshot(100) == before
+        await runtime.finish(ProxyFinish("one", "A", "success", True))
+        assert state.snapshot(100)[0].pending_work_ms == 0
+
+    asyncio.run(run())
+
+
+def test_uncertainty_is_idempotent_until_real_terminal_confirmation() -> None:
+    async def run() -> None:
+        runtime, state = components()
+        await runtime.route({"request_id": "one", "prompt": [1, 2], "max_tokens": 1})
+        for _ in range(2):
+            await runtime.finish(ProxyFinish("one", "A", "timeout", False))
+            assert state.snapshot(100)[0].pending_work_ms == 20
+        await runtime.finish(ProxyFinish("one", "A", "success", True))
+        assert state.snapshot(100)[0].pending_work_ms == 0
+        assert not state.snapshot(100)[0].healthy
+        with pytest.raises(ValueError):
+            await runtime.finish(ProxyFinish("one", "A", "success", True))
+
+    asyncio.run(run())
+
+
 def test_native_completion_reservation_uses_confirmed_fetch_path() -> None:
     async def run() -> None:
         worker = WorkerSnapshot("A", "http://worker/v1/completions", True, 0, 0)

@@ -103,13 +103,26 @@ class RoutingRuntime:
             result: The proxy's exactly-once terminal callback.
 
         Raises:
-            ValueError: Duplicate or inconsistent terminal callback.
+            ValueError: Duplicate confirmed terminal or inconsistent worker.
             KeyError: A selected request was never reserved.
+
+        Notes:
+            Uncertain notifications are idempotent. Later real terminal
+            evidence may release retained work but does not clear taint.
+            An unselected failed route with no reservation is a no-op.
         """
-        if not result.worker_id:
-            return
         now = self._clock()
         if result.worker_terminal_confirmed:
-            self._telemetry.confirmed_complete(result.request_id, now)
+            if not result.worker_id:
+                raise ValueError("confirmed completion requires worker identity")
+            self._telemetry.confirmed_complete(
+                result.request_id, now, worker_id=result.worker_id
+            )
         else:
-            self._telemetry.cancel_unconfirmed(result.request_id, now)
+            try:
+                self._telemetry.cancel_unconfirmed(
+                    result.request_id, now, worker_id=result.worker_id
+                )
+            except KeyError:
+                if result.worker_id:
+                    raise

@@ -21,7 +21,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "command", choices=("preflight", "generate", "analyze", "smoke", "serve")
     )
-    args, remaining = parser.parse_known_args(argv)
+    parser.add_argument("arguments", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    remaining = args.arguments
     if args.command == "preflight":
         return preflight.main(remaining)
     elif args.command == "generate":
