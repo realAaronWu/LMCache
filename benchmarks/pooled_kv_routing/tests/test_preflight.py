@@ -4,6 +4,7 @@
 # Standard
 from copy import deepcopy
 from pathlib import Path
+from typing import cast
 import hashlib
 import json
 import os
@@ -163,7 +164,7 @@ def bind_native(tmp_path: Path, cfg: dict, cases: list | None = None) -> None:
     provenance = {
         k: cfg[k] for k in ("run_id", "source", "model", "environment", "nodes")
     }
-    probe = {
+    probe: dict[str, object] = {
         "provenance_sha256": hashlib.sha256(
             json.dumps(provenance, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest(),
@@ -184,29 +185,29 @@ def bind_native(tmp_path: Path, cfg: dict, cases: list | None = None) -> None:
         ],
     }
     records = []
-    for item in probe["cases"]:
+    for item in cast(list[dict[str, object]], probe["cases"]):
         case = {k: item[k] for k in ("name", "request_id", "host_ids")}
         identity = dict(
             case, run_id=cfg["run_id"], provenance_sha256=probe["provenance_sha256"]
         )
         case["reference"] = capture(
             tmp_path,
-            item["name"] + "-reference",
+            cast(str, item["name"]) + "-reference",
             "reference",
             identity,
             {
                 "token_ids": item["expected_token_ids"],
-                "token_count": len(item["expected_token_ids"]),
+                "token_count": len(cast(list[int], item["expected_token_ids"])),
             },
         )
         case["probe"] = capture(
             tmp_path,
-            item["name"] + "-probe",
+            cast(str, item["name"]) + "-probe",
             "probe",
             identity,
             {
                 "token_ids": item["actual_token_ids"],
-                "token_count": len(item["actual_token_ids"]),
+                "token_count": len(cast(list[int], item["actual_token_ids"])),
                 **{
                     k: item[k]
                     for k in (
@@ -334,7 +335,7 @@ def primary_config(tmp_path: Path, cfg: dict) -> dict:
     node = load(cfg["nodes"][0])["observation"]
     node.update(host_id="machine-B", gpu_uuid="GPU-B", rdma_gid="gid-B")
     cfg["nodes"].append(node_artifact(tmp_path, "node-B", cfg, node))
-    case = {
+    case: dict[str, object] = {
         "expected_token_ids": [1, 2],
         "actual_token_ids": [1, 2],
         "loader_extra_args": {},
@@ -358,7 +359,7 @@ def primary_config(tmp_path: Path, cfg: dict) -> dict:
             external_fetches=1,
         )
         if name == "B_to_A":
-            item["host_ids"].reverse()
+            cast(list[str], item["host_ids"]).reverse()
         if name in ("miss", "skip_load"):
             item.update(remote_bytes=0, external_fetches=0)
         if name == "skip_load":
