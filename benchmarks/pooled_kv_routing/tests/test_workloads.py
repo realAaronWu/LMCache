@@ -2,6 +2,7 @@
 # Standard
 from dataclasses import asdict, replace
 from pathlib import Path
+from typing import TypedDict
 import hashlib
 import json
 import subprocess
@@ -14,10 +15,33 @@ import pytest
 from benchmarks.pooled_kv_routing import workloads
 
 
+class CorpusFamily(TypedDict):
+    family: str
+    split: str
+    prefix_token_ids: list[int]
+    suffixes: list[list[int]]
+
+
+class Corpus(TypedDict):
+    version: int
+    source: str
+    license: str
+    tokenizer_revision: str
+    families: list[CorpusFamily]
+
+
+class TraceSpecChanges(TypedDict, total=False):
+    corpus_sha256: str
+    background_fraction: float
+    prefix_tokens: int
+    arrival_rate: float
+    tokenizer_revision: str
+
+
 @pytest.fixture
 def spec(tmp_path: Path) -> workloads.TraceSpec:
     # Synthetic token IDs test serialization, not semantic workload efficacy.
-    corpus = {
+    corpus: Corpus = {
         "version": 1,
         "source": "test fixture",
         "license": "CC0",
@@ -82,7 +106,9 @@ def test_trace_is_content_split_seeded_and_background_counted(
         {"tokenizer_revision": "b" * 40},
     ],
 )
-def test_trace_rejects_unfrozen_inputs(spec: workloads.TraceSpec, change: dict) -> None:
+def test_trace_rejects_unfrozen_inputs(
+    spec: workloads.TraceSpec, change: TraceSpecChanges
+) -> None:
     with pytest.raises(ValueError):
         workloads.generate(replace(spec, **change), 101)
 

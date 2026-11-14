@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from pathlib import Path
-from typing import Any
+from typing import TypedDict, cast
 import copy
 import hashlib
 import json
@@ -15,10 +15,22 @@ import pytest
 from benchmarks.pooled_kv_routing import analysis
 
 
-def packet(tmp_path: Path, improvement: float = 0.10) -> tuple[dict[str, Any], Path]:
+class InventoryEntry(TypedDict):
+    case_id: str
+    arm: str
+    path: str
+    sha256: str
+
+
+class Inventory(TypedDict):
+    version: int
+    files: list[InventoryEntry]
+
+
+def packet(tmp_path: Path, improvement: float = 0.10) -> tuple[analysis.Protocol, Path]:
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
-    protocol: dict[str, Any] = {
+    protocol: analysis.Protocol = {
         "version": 1,
         "baseline": "LEW",
         "config_sha256": "a" * 64,
@@ -28,7 +40,7 @@ def packet(tmp_path: Path, improvement: float = 0.10) -> tuple[dict[str, Any], P
         "cases": [],
         "argv": {"LEW": ["runner", "LEW"], "Cost": ["runner", "Cost"]},
     }
-    inventory = {"version": 1, "files": []}
+    inventory: Inventory = {"version": 1, "files": []}
     for scenario, count in (
         ("primary", 12),
         ("equal-load", 8),
@@ -39,7 +51,7 @@ def packet(tmp_path: Path, improvement: float = 0.10) -> tuple[dict[str, Any], P
     ):
         for block in range(count):
             case_id = f"{scenario}-{block}"
-            requests = [
+            requests: list[analysis.RequestSpec] = [
                 {
                     "request_id": "shared",
                     "request_class": "shared",
@@ -59,7 +71,7 @@ def packet(tmp_path: Path, improvement: float = 0.10) -> tuple[dict[str, Any], P
                     "expected_token_ids": [7, 8],
                 },
             ]
-            case = {
+            case: analysis.CaseSpec = {
                 "case_id": case_id,
                 "scenario": scenario,
                 "block": block,
@@ -237,15 +249,16 @@ def test_missing_controls_and_boolean_attestations_cannot_qualify(
     tmp_path: Path,
 ) -> None:
     protocol, artifacts = packet(tmp_path)
-    altered = copy.deepcopy(protocol)
+    altered: dict[str, object] = dict(copy.deepcopy(protocol))
     altered["rdma_eligible"] = True
     with pytest.raises(ValueError):
-        analysis.analyze(altered, artifacts)
+        # Deliberately cross the typed boundary to exercise unknown-field rejection.
+        analysis.analyze(cast(analysis.Protocol, altered), artifacts)
     # No source-side flag can promote the external safety/mechanism gates.
     assert analysis.analyze(protocol, artifacts)["acceptance"]["AC6"] == "NOT RUN"
 
 
-def reseal(protocol: dict[str, Any], artifacts: Path) -> None:
+def reseal(protocol: analysis.Protocol, artifacts: Path) -> None:
     inventory = json.loads((artifacts / "inventory.json").read_text())
     digest = hashlib.sha256(
         json.dumps(protocol, sort_keys=True, separators=(",", ":")).encode()
