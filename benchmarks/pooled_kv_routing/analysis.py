@@ -224,6 +224,7 @@ def _validate_protocol(protocol: Protocol) -> None:
     )
     seen: set[str] = set()
     blocks: dict[str, list[int]] = {}
+    baseline_first: dict[str, int] = {}
     for case in cases:
         _fields(case, "case_id scenario block seed order requests")
         case_id, scenario, block = case["case_id"], case["scenario"], case["block"]
@@ -253,10 +254,13 @@ def _validate_protocol(protocol: Protocol) -> None:
         )
         order = [protocol["baseline"], "Cost"]
         _require(
-            case["order"] == (order if block % 2 == 0 else order[::-1]),
-            "unbalanced arm order",
+            case["order"] in (order, order[::-1]),
+            "invalid frozen arm order",
         )
         blocks.setdefault(scenario, []).append(block)
+        baseline_first[scenario] = baseline_first.get(scenario, 0) + (
+            case["order"] == order
+        )
         requests = case["requests"]
         _require(
             isinstance(requests, list) and 0 < len(requests) <= 100_000,
@@ -300,6 +304,10 @@ def _validate_protocol(protocol: Protocol) -> None:
         "primary block inventory mismatch",
     )
     for scenario, numbers in blocks.items():
+        _require(
+            abs(2 * baseline_first[scenario] - len(numbers)) <= 1,
+            f"unbalanced arm order in {scenario}",
+        )
         _require(
             sorted(numbers) == list(range(len(numbers))),
             f"duplicate/missing blocks in {scenario}",

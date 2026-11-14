@@ -252,7 +252,12 @@ async def _serve(
         if device not in {"cuda", "cuda:0"}:
             raise ValueError("endpoint CUDA device receipt missing")
         model_config = _object(config.get("model_config"))
-        if model_config.get("model") not in {args.model, selected[0].get("root")}:
+        configured_model = model_config.get("model")
+        if (
+            not isinstance(configured_model, str)
+            or not configured_model
+            or configured_model not in {args.model, selected[0].get("root")}
+        ):
             raise ValueError("endpoint model config mismatch")
         parallel = _object(config.get("parallel_config"))
         for name in (
@@ -308,32 +313,16 @@ async def _serve(
             case["status"] = "PASS"
 
 
-def _cuda_receipt(prefix: list[int]) -> dict[str, object]:
-    """Query actual local CUDA; optionally check a selected-prefix H2D/D2H copy."""
+def _cuda_receipt() -> dict[str, object]:
+    """Query actual local CUDA without allocating tensors or claiming route mapping."""
     if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
         raise ValueError("actual local torch CUDA device unavailable")
-    receipt: dict[str, object] = {
+    return {
         "torch_version": str(torch.__version__),
         "cuda_version": torch.version.cuda,
         "device_count": torch.cuda.device_count(),
         "device_name": torch.cuda.get_device_name(0),
-        "selected_prefix_copy": "NOT RUN",
     }
-    if prefix:
-        host = torch.tensor(prefix, dtype=torch.int64)
-        device = host.to("cuda:0")
-        restored = device.to("cpu")
-        torch.cuda.synchronize(0)
-        if not torch.equal(host, restored):
-            raise ValueError("CUDA selected-prefix payload mismatch")
-        receipt["selected_prefix_copy"] = {
-            "status": "PASS",
-            "tokens": len(prefix),
-            "bytes": host.numel() * host.element_size(),
-            "dtype": str(host.dtype),
-            "payload_sha256": hashlib.sha256(json.dumps(prefix).encode()).hexdigest(),
-        }
-    return receipt
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -354,7 +343,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--max-tokens", type=int, default=8)
     parser.add_argument("--deadline-seconds", type=float, default=120)
-    parser.add_argument("--cuda-prefix-tokens", type=int, default=0)
     args = parser.parse_args(argv)
     try:
         args.output_dir.mkdir(parents=True, exist_ok=False)
@@ -394,8 +382,6 @@ def main(argv: list[str] | None = None) -> int:
         corpus = [_ids(v, MAX_TOKENS) for v in value]
         if any(not prompt for prompt in corpus):
             raise ValueError("empty prompt")
-        if not 0 <= args.cuda_prefix_tokens <= len(corpus[0]):
-            raise ValueError("CUDA prefix must be within first prompt")
         report["inputs"] = {
             "model": args.model,
             "corpus_token_ids": corpus,
@@ -403,9 +389,9 @@ def main(argv: list[str] | None = None) -> int:
             "direct_endpoint": args.direct_endpoint,
             "proxy_endpoint": args.proxy_endpoint,
             "deadline_seconds": args.deadline_seconds,
-            "cuda_prefix_tokens": args.cuda_prefix_tokens,
+            "max_tokens": args.max_tokens,
         }
-        report["cuda"] = _cuda_receipt(corpus[0][: args.cuda_prefix_tokens])
+        report["cuda"] = _cuda_receipt()
 
         async def run() -> None:
             await asyncio.wait_for(_serve(args, corpus, report), args.deadline_seconds)

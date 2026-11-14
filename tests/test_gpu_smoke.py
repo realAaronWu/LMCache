@@ -82,11 +82,17 @@ def endpoint(mode: str = "ok") -> Iterator[tuple[str, list[dict[str, object]]]]:
         def do_GET(self) -> None:
             body: dict[str, object]
             if self.path == "/v1/models":
-                body = {"data": [{"id": "tiny", "root": "tiny"}]}
+                body = {
+                    "data": [
+                        {"id": "tiny", "root": None if mode == "no_model" else "tiny"}
+                    ]
+                }
             else:
                 body = {
                     "vllm_config": {
-                        "model_config": {"model": "tiny"},
+                        "model_config": {
+                            "model": None if mode == "no_model" else "tiny"
+                        },
                         "device_config": {
                             "device": "cpu" if mode == "no_device" else "cuda"
                         },
@@ -220,7 +226,7 @@ def test_invalid_stream_retains_evidence(
     assert (tmp_path / "evidence" / "0-proxy.sse").stat().st_size <= 4 * 1024 * 1024
 
 
-@pytest.mark.parametrize("mode", ["no_device", "missing_endpoint"])
+@pytest.mark.parametrize("mode", ["no_device", "missing_endpoint", "no_model"])
 def test_missing_receipt_refused(
     smoke: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str
 ) -> None:
@@ -262,7 +268,6 @@ def test_cli_queries_local_cuda(
         ("--deadline-seconds", "nan"),
         ("--deadline-seconds", "inf"),
         ("--max-tokens", "0"),
-        ("--cuda-prefix-tokens", "4"),
         ("--direct-endpoint", "http://user:secret@localhost"),
         ("--proxy-endpoint", ""),
         ("--proxy-endpoint", "http://localhost/v1"),

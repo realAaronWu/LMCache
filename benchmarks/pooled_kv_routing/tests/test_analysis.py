@@ -384,3 +384,16 @@ def test_background_class_remains_in_report(tmp_path: Path) -> None:
     row = analysis.analyze(protocol, artifacts)["metrics"]["primary"]["arms"]["Cost"][0]
     assert row["classes"]["background"]["requests"] == 1
     assert row["classes"]["shared"]["requests"] == 1
+
+
+def test_frozen_balanced_order_not_forced_to_alternate(tmp_path: Path) -> None:
+    protocol, artifacts = packet(tmp_path)
+    for case in protocol["cases"]:
+        case["order"] = case["order"][::-1]
+    reseal(protocol, artifacts)
+    assert analysis.analyze(protocol, artifacts)["evidence_status"] == "PASS"
+    for case in protocol["cases"]:
+        case["order"] = ["LEW", "Cost"]
+    reseal(protocol, artifacts)
+    with pytest.raises(ValueError, match="unbalanced"):
+        analysis.analyze(protocol, artifacts)
